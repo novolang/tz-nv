@@ -1,0 +1,99 @@
+// tzerr.nv — everything that can be wrong, and where.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ONE ERROR TYPE FOR FOUR READERS.  The pack reader, the TZif reader,
+// the POSIX footer parser and the zone lookup all answer the same
+// enum, because a caller assembling a zone does all four in sequence
+// and a `Result` per reader would make the assembly four nested
+// matches.  The variants say which reader spoke.
+//
+// EVERY VARIANT CARRIES A POSITION, and that is the part worth
+// defending.  A zone file that fails to parse is a file somebody has
+// to look at with a hex editor, and "malformed TZif" sends them to the
+// beginning of a 3 KB binary.  `TzifTruncated(needed, had)` sends them
+// to the field that ran out.  The rule is the one url-nv and asn1-nv
+// already keep: a refusal names the byte.
+//
+// WHAT IS NOT AN ERROR.  A local time that falls in a spring-forward
+// gap, and a local time that happens twice in an autumn overlap, are
+// not errors — they are `tzlocal.TzLocal`'s other two variants, and
+// modelling them as failures would send the ordinary case down the
+// failure path twice a year.  `tzlocal.to_utc` answers a `Result` only
+// because a caller may ASK to be refused, with `TzPickReject`.
+
+// What went wrong while a zone was being assembled or asked.
+pub enum TzError
+    // No zone and no link by that name in this database.  The name is
+    // carried because a caller looking one up from configuration wants
+    // to print what the configuration said, not what it meant.
+    TzUnknownZone(name: Str)
+    // The bundled or supplied pack does not decode.  The byte offset
+    // is where the reader stopped.
+    TzPackUnreadable(offset: Int)
+    // The pack's format version is not the one this release reads.
+    // Both spellings are carried: a pack built by a newer tz-nv is a
+    // different failure from a truncated one and wants a different
+    // answer from the operator.
+    TzPackVersion(found: Str, expected: Str)
+    // The instant is outside the range this zone's table covers and
+    // the zone has no POSIX footer rule to extend it with.  The zone
+    // and the instant are both named, because "out of range" without
+    // them is a message nobody can act on.
+    TzZoneOutOfRange(zone: Str, at: Int)
+    // A POSIX TZ string did not parse, at this byte offset into it.
+    TzPosixMalformed(offset: Int)
+    // The first four bytes were not `TZif`.
+    TzifBadMagic
+    // The TZif version byte names a version this reader does not
+    // implement.  Versions 1, 2, 3 and 4 are read; the byte is carried
+    // so a file from the future says so by number.
+    TzifUnsupportedVersion(found: Int)
+    // The file ended inside a field.  `needed` is how many bytes the
+    // field wanted and `had` is how many were left.
+    TzifTruncated(needed: Int, had: Int)
+    // The header declared zero local-time types, which no valid TZif
+    // file does: every file has at least the type its first transition
+    // leaves.
+    TzifNoTypes
+    // A transition index in the file points past the end of the type
+    // table.  The index and the table's size are both carried.
+    TzifTypeIndexOutOfRange(index: Int, types: Int)
+
+// A refusal says what it is, in one line, with the position in it.
+//
+// The `Error` impl rather than a free function, because `Result`
+// requires it: a payload that does not implement `Error` is refused at
+// the signature (SPEC § 3.4), and calendar-nv's `CalError` answers the
+// same way, so a caller handling one handles this one.
+//
+// The wording is what a `novo` tool would print: lower case, no
+// trailing stop, and the fact first.
+//
+// ```novo
+// use tzerr
+//
+// fn main() [io]
+//     println(TzUnknownZone("Europe/Atlantis").message())
+// ```
+impl Error for TzError
+    fn message(self) -> Str
+        todo("tz-nv.TzError.message")
+
+// The byte offset the failure is at, or `-1` where the failure has no
+// position — an unknown zone name is a lookup that failed, not a byte
+// that was wrong.
+//
+// calendar-nv's `calerror.offset_of` answers the same question the
+// same way, so a caller that already handles one handles this one.
+pub fn offset_of(e: TzError) -> Int []
+    todo("tz-nv.tzerr.offset_of")
+
+// Which reader produced the failure: `"pack"`, `"tzif"`, `"posix"` or
+// `"lookup"`.
+//
+// A string rather than a second enum, because the only thing a caller
+// does with it is put it in a message, and an enum nobody matches on
+// is a type two packages have to agree about for no gain.
+pub fn source_of(e: TzError) -> Str []
+    todo("tz-nv.tzerr.source_of")

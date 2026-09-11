@@ -1,0 +1,236 @@
+// tzzone.nv — one zone, and the questions asked at a UTC instant.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A ZONE IS A STEP FUNCTION FROM INSTANTS TO OFFSETS, and that is the
+// whole of it. Give it a UTC second and it answers how far east of UTC
+// the wall clocks were, what people called that offset, and whether
+// daylight saving was in force. Everything harder — a local time that
+// happened twice, a local time that never happened — is the INVERSE of
+// this function, and the inverse is `tzlocal`'s, because the inverse
+// is not a function at all.
+//
+// WHY THE QUESTIONS ARE ASKED AT AN INSTANT AND NOT AT A DATE. An
+// instant is unambiguous by construction: there is exactly one offset
+// in force at a given UTC second, in every zone, forever. So this
+// module cannot fail and none of its calls answer a `Result`. The one
+// thing that can go wrong — an instant past the end of the table in a
+// zone with no footer rule — is settled at zone construction instead,
+// by `table_covers` and `posix_rule` being readable facts rather than
+// surprises.
+//
+// THE TRANSITION TABLE AND THE FOOTER ARE ONE SURFACE. A zone answers
+// from its table where the table reaches, and from its POSIX footer
+// rule past the end of it, and a caller never has to know which
+// answered. What a caller CAN know, and sometimes needs to, is
+// `table_covers`: an archival application converting a 1901 timestamp
+// wants to be told the answer is an extrapolation rather than a
+// record.
+//
+// SECONDS EAST OF UTC, EVERYWHERE, with no exception and no second
+// convention. Berlin in winter is `3600`. Kolkata is `19800`. New York
+// in winter is `-18000`. The POSIX TZ string's opposite convention is
+// flipped once, inside `tzposix.parse`, and never appears here.
+
+use tzerr
+use tzposix
+
+// The offset in force at some instant, with the two facts a caller
+// prints beside it.
+//
+// Not `@value`, deliberately: `abbrev` is a `Str`, and a `@value`
+// struct holds scalars only. It is also an enum payload in
+// `tzlocal.TzLocal`, which a `@value` struct may not be (SPEC § 14.5),
+// so the choice is forced twice over. The device half of this package
+// answers loose integers instead, in `tzposix`.
+pub struct TzOffset
+    // The total offset east of UTC, in seconds: standard plus save.
+    // This is the number added to a UTC instant to get a wall clock.
+    total_seconds: Int
+    // The standard component on its own.
+    standard_seconds: Int
+    // The daylight-saving component: `0` outside it, usually `3600`
+    // inside, and `1800` in Lord Howe Island, which is the reason this
+    // is a number rather than a flag.
+    save_seconds: Int
+    // What the offset is called: `"CET"`, `"CEST"`, `"IST"`, or a
+    // numeric form like `"+0530"` where the zone has no name for it.
+    // IANA stopped inventing abbreviations in 2017, so numeric forms
+    // are the common case for new zones rather than the exception.
+    abbrev: Str
+    // Whether daylight saving is in force. `save_seconds != 0` for
+    // every zone in the database today, but the two are separate
+    // fields because the TZif format carries them separately and a
+    // reader that collapsed them would be deciding for the file.
+    is_dst: Bool
+
+// One change of offset: when it happened, and what it was on each side.
+pub struct TzTransition
+    // The UTC second at which the new offset takes effect. The first
+    // instant AT the new offset, not the last one at the old.
+    at: Int
+    // What was in force immediately before.
+    before: TzOffset
+    // What is in force from `at` onward.
+    after: TzOffset
+
+// A time zone: a name, a transition table, and optionally a POSIX
+// footer rule for instants past the table's end.
+pub struct TzZone
+    // The IANA name this zone was looked up by — `"Europe/Berlin"`.
+    // A zone reached through a link carries the CANONICAL name, not
+    // the link: `tzdata.zone(db, "US/Eastern")` answers a zone named
+    // `"America/New_York"`, because the link is a spelling and the
+    // zone is a place. `tzdata.canonical_name` is how a caller asks
+    // the other question.
+    name: Str
+    // How many transitions the table holds. The table itself is not a
+    // public field: it is a packed integer array, and exposing it
+    // would fix a representation this package intends to keep free to
+    // change. `transition_at` and `transitions_between` are the reads.
+    transition_count: Int
+    // The rule that extends this zone past its last transition, or
+    // `?` where the zone has none — which is every zone with no
+    // daylight saving and no future changes planned.
+    rule: ?tzposix.TzPosixRule
+
+// The zone's canonical IANA name.
+pub fn zone_name(z: TzZone) -> Str []
+    todo("tz-nv.tzzone.zone_name")
+
+// The offset in force at a UTC instant.
+//
+// Cannot fail. Past the table's end the footer rule answers; past the
+// table's end with no footer rule, the last transition's offset
+// answers and `table_covers` is how a caller finds out that is what
+// happened.
+//
+// ```novo
+// use tzdata
+// use tzzone
+//
+// fn main() [io]
+//     let db = tzdata.data_compact()
+//     match tzdata.zone(db, "Europe/Berlin")
+//         Ok(z)  => println(tzzone.offset_at(z, 1750000000).abbrev)
+//         Err(_) => println("no such zone")
+// ```
+pub fn offset_at(z: TzZone, utc_second: Int) -> TzOffset []
+    todo("tz-nv.tzzone.offset_at")
+
+// The offset in seconds east of UTC at a UTC instant.
+//
+// `offset_at(z, s).total_seconds`, published on its own because it is
+// the only field most callers want and building the `Str` for
+// `abbrev` to throw it away is the common case.
+pub fn offset_seconds_at(z: TzZone, utc_second: Int) -> Int []
+    todo("tz-nv.tzzone.offset_seconds_at")
+
+// The abbreviation in force at a UTC instant.
+pub fn abbrev_at(z: TzZone, utc_second: Int) -> Str []
+    todo("tz-nv.tzzone.abbrev_at")
+
+// Whether daylight saving is in force at a UTC instant.
+pub fn is_dst_at(z: TzZone, utc_second: Int) -> Bool []
+    todo("tz-nv.tzzone.is_dst_at")
+
+// The first transition strictly after a UTC instant, or `?` where the
+// zone has no more changes — a fixed zone, or a table with no footer
+// rule that has run out.
+//
+// This is what a scheduler asks: "when does the offset I just computed
+// stop being right". novoagent's timer and cron-nv's next-fire both
+// need it, because a job computed for a local wall time has to be
+// recomputed if the offset moves under it.
+pub fn transition_after(z: TzZone, utc_second: Int) -> ?TzTransition []
+    todo("tz-nv.tzzone.transition_after")
+
+// The last transition at or before a UTC instant, or `?` where the
+// instant precedes every transition the zone records.
+pub fn transition_before(z: TzZone, utc_second: Int) -> ?TzTransition []
+    todo("tz-nv.tzzone.transition_before")
+
+// Every transition in the half-open UTC range `[from_second, to_second)`.
+//
+// Bounded by the range and not by the table, so a footer rule
+// contributes its changes here too: asking a European zone for the
+// year 2400 answers two transitions that are in no file.
+pub fn transitions_between(z: TzZone, from_second: Int, to_second: Int) -> [TzTransition] []
+    todo("tz-nv.tzzone.transitions_between")
+
+// The `i`th transition in the zone's own table, counting from zero, or
+// `?` where `i` is out of range.
+//
+// The table only — the footer rule contributes nothing here, because
+// the footer has no index.
+pub fn transition_at(z: TzZone, i: Int) -> ?TzTransition []
+    todo("tz-nv.tzzone.transition_at")
+
+// How many transitions the zone's table holds.
+pub fn transition_count(z: TzZone) -> Int []
+    todo("tz-nv.tzzone.transition_count")
+
+// Whether the zone's own table covers this instant, as opposed to the
+// answer being extrapolated from the footer rule or held flat from the
+// last entry.
+//
+// The honest form of "we know this" versus "we computed this", and the
+// reason it is public: an application stamping a legal record wants to
+// know which it got.
+pub fn table_covers(z: TzZone, utc_second: Int) -> Bool []
+    todo("tz-nv.tzzone.table_covers")
+
+// The first and last UTC seconds the zone's table covers, as a pair.
+//
+// A zone with no transitions answers `(0, 0)`, which `transition_count`
+// of zero is how a caller tells apart from a zone that happens to
+// cover the epoch alone.
+pub fn table_range(z: TzZone) -> (Int, Int) []
+    todo("tz-nv.tzzone.table_range")
+
+// The zone's POSIX footer rule, or `?` where it has none.
+pub fn posix_rule(z: TzZone) -> ?tzposix.TzPosixRule []
+    todo("tz-nv.tzzone.posix_rule")
+
+// Every distinct offset the zone has ever been at, oldest first.
+//
+// What a picker populates a menu from, and what a validator checks a
+// stored offset against.
+pub fn offsets_of(z: TzZone) -> [TzOffset] []
+    todo("tz-nv.tzzone.offsets_of")
+
+// A zone with one offset and no transitions.
+//
+// `from_posix(tzposix.fixed("UTC", 0), "UTC")` is the same value; this
+// is the spelling for the case a caller has an offset and a label and
+// no rule at all, which is what a stored `+05:30` in a database row
+// is.
+pub fn fixed(name: Str, offset_seconds: Int, abbrev: Str) -> TzZone []
+    todo("tz-nv.tzzone.fixed")
+
+// UTC itself, as a zone.
+pub fn utc() -> TzZone []
+    todo("tz-nv.tzzone.utc")
+
+// A zone whose whole content is a POSIX rule and no table.
+//
+// What `TZ=EST5EDT,M3.2.0,M11.1.0` means, and what a device provisions
+// itself with. It is a real zone to every function in this module; it
+// simply has nothing to say about 1974, when the United States moved
+// its rules by act of Congress.
+pub fn from_posix(rule: tzposix.TzPosixRule, name: Str) -> TzZone []
+    todo("tz-nv.tzzone.from_posix")
+
+// Whether the zone ever changes offset.
+pub fn is_fixed(z: TzZone) -> Bool []
+    todo("tz-nv.tzzone.is_fixed")
+
+// The instant the zone stops being able to answer from its own
+// records, as a `Result` a caller can refuse on.
+//
+// `Ok(second)` is the last instant the table covers; `Err` names the
+// zone when the zone has no table at all. Most callers want
+// `table_covers`; this is for the one that wants to report the horizon
+// rather than test a point.
+pub fn table_horizon(z: TzZone) -> Result<Int, tzerr.TzError> []
+    todo("tz-nv.tzzone.table_horizon")

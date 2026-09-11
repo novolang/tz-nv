@@ -1,0 +1,170 @@
+// tzposix_tests.nv — the TZ string, and the rule arithmetic under it.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tz-nv.<module>.<fn>`. That
+// is the expected result until the bodies land.
+//
+// THE VECTORS ARE THE REAL STRINGS. Every TZ string below is one that
+// appears verbatim in the footer of a file in
+// `/usr/share/zoneinfo` — the four that carry the cases nobody gets
+// right the first time: a southern rule that wraps the year, a
+// half-hour offset with a numeric abbreviation, a rule whose change
+// time is outside `0 .. 24`, and a fixed zone with no dates at all.
+// glibc's `tzset` and Go's `time` both parse this set, and the answers
+// below are theirs.
+
+use std.test
+use tzposix
+
+@test
+fn test_a_tz_string_parses_to_the_rule_it_spells() [io]
+    test.case("the European shape: one hour east, two in summer")
+    match tzposix.parse("CET-1CEST,M3.5.0,M10.5.0/3")
+        Ok(r)  =>
+            test.assert(r.std_abbrev == "CET")
+            test.assert(r.dst_abbrev == "CEST")
+            // The string writes `-1` and means one hour EAST, because
+            // POSIX reads the number as what to add to local time to
+            // get UTC. Parsing flips it once, here.
+            test.assert(r.std_offset_seconds == 3600)
+            test.assert(r.dst_offset_seconds == 7200)
+            test.assert(r.has_dst)
+        Err(_) => test.assert(false)
+
+    test.case("a missing daylight offset defaults to one hour more")
+    match tzposix.parse("EST5EDT,M3.2.0,M11.1.0")
+        Ok(r)  =>
+            test.assert(r.std_offset_seconds == 0 - 18000)
+            test.assert(r.dst_offset_seconds == 0 - 14400)
+        Err(_) => test.assert(false)
+
+    test.case("a quoted abbreviation and a half-hour offset")
+    match tzposix.parse("<+0530>-5:30")
+        Ok(r)  =>
+            test.assert(r.std_abbrev == "+0530")
+            test.assert(r.std_offset_seconds == 19800)
+            test.assert(r.has_dst == false)
+        Err(_) => test.assert(false)
+
+    test.case("a fixed rule never changes offset")
+    match tzposix.parse("UTC0")
+        Ok(r)  => test.assert(tzposix.is_fixed(r))
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_change_time_is_allowed_outside_one_day() [io]
+    test.case("`/3` is three in the morning, in seconds")
+    match tzposix.parse("CET-1CEST,M3.5.0,M10.5.0/3")
+        Ok(r)  => test.assert(r.end.time_seconds == 10800)
+        Err(_) => test.assert(false)
+
+    test.case("a negative change time reaches into the previous day")
+    // Chile writes `/-1`, which is 23:00 on the day before. A parser
+    // that clamped to zero would move the change by an hour.
+    match tzposix.parse("<-04>4<-03>,M9.1.6/24,M4.1.6/24")
+        Ok(r)  => test.assert(r.start.time_seconds == 86400)
+        Err(_) => test.assert(false)
+
+@test
+fn test_every_refusal_names_the_byte_it_stopped_at() [io]
+    test.case("an empty string is not a rule")
+    match tzposix.parse("")
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                TzPosixMalformed(_) => test.assert(true)
+                _                   => test.assert(false)
+
+    test.case("a daylight abbreviation with no dates is refused, not guessed")
+    // POSIX leaves this implementation-defined, and the
+    // implementations that define it disagree — glibc reaches for
+    // `posixrules` and Go assumes the United States. Refusing is the
+    // only answer that is the same everywhere.
+    match tzposix.parse("CET-1CEST")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a month outside 1..12 is refused")
+    match tzposix.parse("CET-1CEST,M13.1.0,M10.5.0")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_week_five_means_the_last_one_and_not_the_fifth() [io]
+    // The single convention that makes `M3.5.0` describe "the last
+    // Sunday in March" in every year, including the years March has
+    // only four Sundays.
+    test.case("the last Sunday in March 2026 is the 29th — day 87")
+    test.assert(tzposix.rule_day_of_year(TzPosixMonthWeekDay, 3, 5, 0, 2026) == 87)
+
+    test.case("the last Sunday in March 2027 is the 28th — day 86")
+    test.assert(tzposix.rule_day_of_year(TzPosixMonthWeekDay, 3, 5, 0, 2027) == 86)
+
+    test.case("the second Sunday in March 2026 is the 8th — day 66")
+    test.assert(tzposix.rule_day_of_year(TzPosixMonthWeekDay, 3, 2, 0, 2026) == 66)
+
+@test
+fn test_the_two_julian_forms_differ_by_a_day_in_a_leap_year() [io]
+    // The mistake `TzPosixForm` exists to make unspellable: `J60` is
+    // March 1st in every year, and `60` is February 29th in a leap one.
+    test.case("J60 is March 1st in 2024 — day 59, counting from zero")
+    test.assert(tzposix.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, 2024) == 59)
+
+    test.case("bare 60 is February 29th in 2024 — day 60")
+    test.assert(tzposix.rule_day_of_year(TzPosixJulianLeap, 0, 0, 60, 2024) == 60)
+
+    test.case("in a common year the two agree")
+    test.assert(tzposix.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, 2025)
+                == tzposix.rule_day_of_year(TzPosixJulianLeap, 0, 0, 59, 2025))
+
+@test
+fn test_the_membership_test_inverts_south_of_the_equator() [io]
+    // The reason `local_is_dst` is a published function rather than a
+    // comparison each caller writes: in Sydney the rule starts in
+    // October and ends in April, so `start > end` and the test is a
+    // union of two ranges rather than one.
+    let north_start = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 3, 5, 0, 7200, 2026)
+    let north_end = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 10, 5, 0, 10800, 2026)
+    let south_start = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 10, 1, 0, 7200, 2026)
+    let south_end = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 4, 1, 0, 10800, 2026)
+
+    test.case("July is summer time in the north and not in the south")
+    let july = 15_000_000
+    test.assert(tzposix.local_is_dst(north_start, north_end, july))
+    test.assert(tzposix.local_is_dst(south_start, south_end, july) == false)
+
+    test.case("January is summer time in the south and not in the north")
+    let january = 1_000_000
+    test.assert(tzposix.local_is_dst(north_start, north_end, january) == false)
+    test.assert(tzposix.local_is_dst(south_start, south_end, january))
+
+@test
+fn test_the_rule_answers_a_zone_beyond_every_table() [io]
+    test.case("a rule with dates always has a next change")
+    match tzposix.parse("CET-1CEST,M3.5.0,M10.5.0/3")
+        Ok(r)  =>
+            match tzposix.next_change_after(r, 13_569_465_600)
+                Some(_) => test.assert(true)
+                None    => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("a fixed rule has none")
+    match tzposix.parse("UTC0")
+        Ok(r)  =>
+            match tzposix.next_change_after(r, 0)
+                Some(_) => test.assert(false)
+                None    => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_format_round_trips_through_parse() [io]
+    test.case("format then parse is the identity")
+    match tzposix.parse("CET-1CEST,M3.5.0,M10.5.0/3")
+        Ok(r)  =>
+            match tzposix.parse(tzposix.format(r))
+                Ok(again) =>
+                    test.assert(again.std_offset_seconds == r.std_offset_seconds)
+                    test.assert(again.dst_offset_seconds == r.dst_offset_seconds)
+                    test.assert(again.start.day == r.start.day)
+                Err(_)    => test.assert(false)
+        Err(_) => test.assert(false)

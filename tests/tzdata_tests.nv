@@ -1,0 +1,221 @@
+// tzdata_tests.nv — the database, the lookup, and a zone's answers at
+// an instant.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tz-nv.<module>.<fn>`. That
+// is the expected result until the bodies land.
+//
+// THE VECTORS ARE THE DATABASE'S OWN. Every instant, offset and
+// abbreviation below is what `zdump -v` prints for the named zone
+// under tzdata 2025b, which is the oracle chrono-tz and Python's
+// `zoneinfo` are both checked against. Four zones carry the cases:
+// Berlin for an ordinary European rule, Kolkata for a half-hour offset
+// with no daylight saving at all, Lord Howe Island for a
+// thirty-minute saving, and Pacific/Apia for the day that does not
+// exist.
+
+use std.test
+use std.list
+use tzdata
+use tzerr
+use tzposix
+use tzzone
+
+@test
+fn test_the_database_says_which_release_it_was_compiled_from() [io]
+    test.case("the release is a fact a caller can read and print")
+    let db = tzdata.data_compact()
+    test.assert(tzdata.data_version(db) == tzdata.TZ_DATA_RELEASE)
+
+    test.case("the full pack carries history and the compact one does not")
+    let full = tzdata.data_full()
+    test.assert(full.has_history)
+    test.assert(db.has_history == false)
+
+    test.case("both packs know the same zones")
+    test.assert(list.len(tzdata.zone_names(full)) == list.len(tzdata.zone_names(db)))
+
+@test
+fn test_a_pack_round_trips_through_bytes() [io]
+    test.case("a pack written out reads back as the same database")
+    let db = tzdata.data_compact()
+    let out: [u8] = []
+    let written = tzdata.pack_bytes(out, db)
+    test.assert(tzdata.pack_len(db) >= 0)
+    match tzdata.data_from_pack(written)
+        Ok(again) => test.assert(tzdata.data_version(again) == tzdata.data_version(db))
+        Err(_)    => test.assert(false)
+
+    test.case("bytes that are not a pack are refused, with the offset")
+    let junk: [u8] = []
+    match tzdata.data_from_pack(junk)
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            test.assert(tzerr.source_of(e) == "pack")
+            test.assert(tzerr.offset_of(e) >= 0)
+
+@test
+fn test_a_link_is_a_spelling_and_a_zone_is_a_place() [io]
+    let db = tzdata.data_compact()
+
+    test.case("a link resolves to its canonical name")
+    test.assert(tzdata.canonical_name(db, "US/Eastern") == Some("America/New_York"))
+
+    test.case("a canonical name resolves to itself")
+    test.assert(tzdata.canonical_name(db, "America/New_York") == Some("America/New_York"))
+
+    test.case("the zone reached through a link carries the canonical name")
+    match tzdata.zone(db, "US/Eastern")
+        Ok(z)  => test.assert(tzzone.zone_name(z) == "America/New_York")
+        Err(_) => test.assert(false)
+
+    test.case("both spellings are known and only one is canonical")
+    test.assert(tzdata.has_zone(db, "US/Eastern"))
+    test.assert(list.len(tzdata.link_names(db)) > 0)
+    test.assert(list.len(tzdata.names_for(db, "America/New_York")) > 1)
+
+    test.case("the lookup is case-sensitive, as IANA's own names are")
+    match tzdata.zone(db, "europe/berlin")
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                TzUnknownZone(name) => test.assert(name == "europe/berlin")
+                _                   => test.assert(false)
+
+    test.case("an unknown name says so and carries what was asked for")
+    match tzdata.zone(db, "Europe/Atlantis")
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            test.assert(tzerr.source_of(e) == "lookup")
+            test.assert(tzerr.offset_of(e) == 0 - 1)
+            test.assert(e.message() != "")
+
+@test
+fn test_the_country_tables_are_what_a_picker_is_built_from() [io]
+    let db = tzdata.data_compact()
+
+    test.case("a zone names the countries it is used in")
+    test.assert(tzdata.countries_of(db, "Europe/Zurich") == ["CH", "DE", "LI"])
+
+    test.case("a country names its zones")
+    test.assert(list.len(tzdata.zones_in_country(db, "DK")) == 2)
+
+    test.case("a zone that is not a place has coordinates for nowhere")
+    test.assert(tzdata.coordinates_of(db, "Etc/GMT+5") == None)
+
+@test
+fn test_a_zone_answers_an_offset_at_every_instant() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            // 2026-01-15T12:00:00Z and 2026-07-15T12:00:00Z.
+            let winter = 1_768_478_400
+            let summer = 1_784_116_800
+
+            test.case("winter is CET at one hour east")
+            let w = tzzone.offset_at(z, winter)
+            test.assert(w.total_seconds == 3600)
+            test.assert(w.save_seconds == 0)
+            test.assert(w.abbrev == "CET")
+            test.assert(w.is_dst == false)
+
+            test.case("summer is CEST at two, with the saving as a number")
+            let s = tzzone.offset_at(z, summer)
+            test.assert(s.total_seconds == 7200)
+            test.assert(s.standard_seconds == 3600)
+            test.assert(s.save_seconds == 3600)
+            test.assert(tzzone.abbrev_at(z, summer) == "CEST")
+            test.assert(tzzone.is_dst_at(z, summer))
+            test.assert(tzzone.offset_seconds_at(z, summer) == 7200)
+
+            test.case("the zone is not fixed and its table has transitions")
+            test.assert(tzzone.is_fixed(z) == false)
+            test.assert(tzzone.transition_count(z) > 0)
+            test.assert(list.len(tzzone.offsets_of(z)) >= 2)
+
+@test
+fn test_the_transitions_are_what_a_scheduler_asks_for() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            let winter = 1_768_478_400
+
+            test.case("the next change after midwinter is the spring one")
+            match tzzone.transition_after(z, winter)
+                None    => test.assert(false)
+                Some(t) =>
+                    test.assert(t.before.total_seconds == 3600)
+                    test.assert(t.after.total_seconds == 7200)
+                    test.assert(t.at > winter)
+
+            test.case("the last change before midwinter is the autumn one")
+            match tzzone.transition_before(z, winter)
+                None    => test.assert(false)
+                Some(t) => test.assert(t.after.total_seconds == 3600)
+
+            test.case("a year holds exactly two changes")
+            let year_start = 1_767_225_600
+            let year_end = 1_798_761_600
+            test.assert(list.len(tzzone.transitions_between(z, year_start, year_end)) == 2)
+
+            test.case("the table is indexable and its range is readable")
+            match tzzone.transition_at(z, 0)
+                Some(t) => test.assert(t.at < winter)
+                None    => test.assert(false)
+            let bounds = tzzone.table_range(z)
+            test.assert(bounds.0 <= bounds.1)
+
+@test
+fn test_the_footer_rule_is_what_answers_the_year_2400() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            // 2400-01-01T00:00:00Z, which is past every table.
+            let far = 13_569_465_600
+
+            test.case("the table does not cover it and the zone still answers")
+            test.assert(tzzone.table_covers(z, far) == false)
+            test.assert(tzzone.offset_seconds_at(z, far) == 3600)
+
+            test.case("the answer came from the footer rule")
+            match tzzone.posix_rule(z)
+                None    => test.assert(false)
+                Some(r) =>
+                    test.assert(tzposix.is_fixed(r) == false)
+                    test.assert(tzposix.offset_seconds_at(r, far) == 3600)
+                    test.assert(tzposix.is_dst_at(r, far) == false)
+                    test.assert(tzposix.abbrev_at(r, far) == "CET")
+                    match tzposix.last_change_before(r, far)
+                        Some(_) => test.assert(true)
+                        None    => test.assert(false)
+
+            test.case("the horizon is the last instant the records reach")
+            match tzzone.table_horizon(z)
+                Ok(h)  => test.assert(h < far)
+                Err(_) => test.assert(false)
+
+@test
+fn test_a_zone_can_be_built_without_a_database_at_all() [io]
+    test.case("UTC is a zone with one offset and no transitions")
+    let u = tzzone.utc()
+    test.assert(tzzone.zone_name(u) == "UTC")
+    test.assert(tzzone.is_fixed(u))
+    test.assert(tzzone.offset_seconds_at(u, 0) == 0)
+
+    test.case("a stored offset and a label make a zone")
+    let f = tzzone.fixed("Asia/Kolkata", 19800, "IST")
+    test.assert(tzzone.offset_seconds_at(f, 0) == 19800)
+    test.assert(tzzone.table_covers(f, 0) == false)
+
+    test.case("a POSIX rule makes one too, and it is a real zone")
+    match tzposix.parse("EST5EDT,M3.2.0,M11.1.0")
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            let z = tzzone.from_posix(r, "US-Eastern-rule")
+            test.assert(tzzone.transition_count(z) == 0)
+            test.assert(tzzone.is_dst_at(z, 1_784_116_800))
+            let fixed_rule = tzposix.fixed("UTC", 0)
+            test.assert(tzposix.is_fixed(fixed_rule))

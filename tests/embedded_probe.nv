@@ -1,0 +1,128 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test. `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.
+//
+// WHAT THE CLAIM COVERS: `tzposix`'s arithmetic, and nothing else.
+//
+// The device this is for is a battery clock — a thermostat, a meter, a
+// panel with an RTC on it — that has to show the right hour to a
+// person. It has no filesystem, no network at the moment it needs the
+// answer, and a few tens of kilobytes of flash it was not planning to
+// spend on a time zone. What it has is one zone, known at
+// manufacture, and forty bytes that describe it:
+//
+//   CET-1CEST,M3.5.0,M10.5.0/3
+//
+// Every number in that string is an `Int` in the firmware's own flash,
+// and turning it plus an RTC reading into a local hour is the five
+// calls below. That is the claim, and this probe is it.
+//
+// WHAT IS NOT CLAIMED, and why saying so is the honest form of the
+// claim. `tzdata` holds a pack of about 96 KB in its compact form,
+// which does not fit the device this probe is about; `tzzone` and
+// `tzif` build lists; `tzlocal` speaks in calendar-nv's civil types
+// and calendar-nv makes no device claim of its own, so a probe that
+// named one would not link. Four of the package's six modules are for
+// a machine with a heap, and the README says which half a reader gets.
+//
+// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be.
+// Every body under `src/` is a `todo()`, so what links today is the
+// SIGNATURES and the types — `Int` in and out, and a payload-free enum
+// matched at the embedded tier. There is no arithmetic in the binary
+// yet, so this probe does not prove the rule evaluation is
+// allocation-free; it proves that nothing in the shape of the surface
+// needs an allocator or a host. Keeping it green once the bodies land
+// is a named cost of the implementation step.
+
+use tzposix
+
+// Berlin's rule, as a device holds it: seven integers and two forms.
+//
+// `CET-1CEST,M3.5.0,M10.5.0/3` — one hour east in winter, two in
+// summer, changing on the last Sunday of March at 02:00 local and the
+// last Sunday of October at 03:00 local. Written out as constants
+// because that is what a provisioning step writes into flash.
+const STD_OFFSET: Int = 3600
+const DST_OFFSET: Int = 7200
+const START_MONTH: Int = 3
+const START_WEEK: Int = 5
+const START_DAY: Int = 0
+const START_TIME: Int = 7200
+const END_MONTH: Int = 10
+const END_WEEK: Int = 5
+const END_DAY: Int = 0
+const END_TIME: Int = 10800
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run. A firmware image has one line of output;
+// making it depend on all of them is what stops a passing run from
+// meaning "the first call linked".
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+    // The leap-year rule, which is the one piece of calendar
+    // arithmetic this module carries itself.
+    if tzposix.is_leap_year(2024)
+        n = n + 1
+    if tzposix.is_leap_year(1900) == false
+        n = n + 1
+    // The three date forms, as a device holds them: a payload-free
+    // enum is a scalar the embedded tier can match on.
+    let m_form: TzPosixForm = TzPosixMonthWeekDay
+    let j_form: TzPosixForm = TzPosixJulianNoLeap
+    // The last Sunday in March 2026 is the 29th — day 87 of the year,
+    // counting from zero.
+    if tzposix.rule_day_of_year(m_form, START_MONTH, START_WEEK, START_DAY, 2026) == 87
+        n = n + 1
+    // `J60` is March 1st in every year, leap or not.
+    if tzposix.rule_day_of_year(j_form, 0, 0, 60, 2024) == 59
+        n = n + 1
+    // The second-of-year form, which is where a negative or
+    // out-of-range `/hh` lands.
+    let start = tzposix.rule_second_of_year(m_form, START_MONTH, START_WEEK,
+                                            START_DAY, START_TIME, 2026)
+    let finish = tzposix.rule_second_of_year(m_form, END_MONTH, END_WEEK,
+                                             END_DAY, END_TIME, 2026)
+    if start < finish
+        n = n + 1
+    // Midsummer is inside the northern rule and midwinter is not.
+    if tzposix.local_is_dst(start, finish, 15_000_000)
+        n = n + 1
+    if tzposix.local_is_dst(start, finish, 1_000_000) == false
+        n = n + 1
+    // The offset the two arms pick.
+    if tzposix.offset_for(STD_OFFSET, DST_OFFSET, true) == DST_OFFSET
+        n = n + 1
+    if tzposix.offset_for(STD_OFFSET, DST_OFFSET, false) == STD_OFFSET
+        n = n + 1
+    // The two calls that turn an RTC reading into the argument
+    // `local_is_dst` wants, with no date type between them.
+    let y = tzposix.local_year(1_750_000_000, STD_OFFSET)
+    if y == 2025
+        n = n + 1
+    let soy = tzposix.local_second_of_year(1_750_000_000, STD_OFFSET, y)
+    if soy > 0
+        n = n + 1
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 11 is the number of checks in `score` on the path a linked build
+    // takes. The count is printed on a failure rather than only
+    // compared, so a device that disagrees with the host says HOW MANY
+    // it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 11
+        hal.uart.write("PASS: tz-embedded\n")
+    else
+        hal.uart.write("FAIL: tz-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

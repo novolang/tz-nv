@@ -1,0 +1,197 @@
+// tzif.nv — the system's own zone files, read as bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY A `core` PACKAGE HAS A FILE FORMAT READER IN IT. It does not
+// have a file reader: it has a PARSER. The bytes of
+// `/usr/share/zoneinfo/Europe/Berlin` arrive as an argument, and every
+// function below is arithmetic over them. The `[fs]` belongs to
+// whoever opened the file — chrono-nv on a server, a firmware image
+// with the file linked into flash, a test with the bytes written in
+// line — which is the sans-IO split this whole grid is built on and
+// the reason `layer = "core"` survives a module called `tzif`.
+//
+// WHY IT IS WORTH HAVING AT ALL, given the bundled pack. Three
+// reasons, and each one is a real deployment:
+//
+//   * An operating system's tzdata is updated by the operating system,
+//     on its own schedule. A long-running service that must agree with
+//     `date(1)` and with every other process on the machine has to
+//     read what those read.
+//   * A container image pins its own zoneinfo, and a program that
+//     disagreed with it would be right about the world and wrong about
+//     the machine it is on.
+//   * A government moves a zone between releases of this package. The
+//     system file updates in days; a package release does not.
+//
+// So the bundled pack is the default and the system files are the
+// escape, and a caller chooses with one call rather than with a
+// dependency.
+//
+// RFC 8536 IS THE SPECIFICATION, and versions 1 through 4 are read.
+// Version 1 is the 32-bit-only original and is still what the first
+// block of every modern file is, for compatibility; version 2 adds the
+// 64-bit block and the POSIX footer; version 3 widens the footer's
+// hour range past 24; version 4 adds the not-yet-used leap-second
+// expiry forms. A version-2-or-later file is read from its SECOND
+// block, always, and the first is skipped — reading the first is how
+// an implementation ends up with 2038 as the end of time.
+//
+// LEAP SECONDS ARE READ AND NOT APPLIED. The records are in the file
+// and `leap_seconds` answers them, because a caller doing TAI
+// conversion needs them; but no conversion in this package consults
+// them, because POSIX time does not count them and a library that
+// silently did would disagree with every clock its caller can read.
+
+use tzerr
+use tzzone
+
+// The first four bytes of every TZif file.
+pub const TZIF_MAGIC = "TZif"
+
+// The counts and offsets out of a TZif block header.
+//
+// Every field is an `Int`, so a `@value` struct is what this wants to
+// be — and it cannot be one. `read_header` answers
+// `Result<TzifHeader, TzError>`, a `@value` struct may not be a
+// `Result` payload (SPEC § 14.5, E2015), and a header read out of
+// bytes that may be truncated has nowhere else to put the refusal.
+// The alternative shapes both cost more than the box saves: a header
+// answered flat with a sentinel field is a refusal a caller can
+// forget to check, and a pair of out-parameters is not a shape this
+// language has. So it is boxed, and the note is here so the next
+// reader does not try the annotation again.
+pub struct TzifHeader
+    // The version byte: `0` for version 1 (the byte is a NUL), or the
+    // ASCII digit's value — 2, 3 or 4.
+    version: Int
+    // How many UT/local indicators follow.
+    isutcnt: Int
+    // How many standard/wall indicators follow.
+    isstdcnt: Int
+    // How many leap-second records follow.
+    leapcnt: Int
+    // How many transition times follow.
+    timecnt: Int
+    // How many local-time types follow. Never zero in a valid file.
+    typecnt: Int
+    // How many bytes of abbreviation strings follow.
+    charcnt: Int
+    // The byte offset in the file at which this block's data begins —
+    // one past the 44-byte header.
+    data_offset: Int
+    // The width of a transition time in this block: 4 in a version-1
+    // block, 8 in a version-2-or-later second block.
+    time_size: Int
+
+// Everything a TZif file says, parsed.
+pub struct TzifData
+    // The version byte, as `TzifHeader.version` reports it.
+    version: Int
+    // The transition times, as UTC seconds, ascending.
+    transitions: [Int]
+    // For each transition, the index into `types` of what takes effect.
+    // Parallel to `transitions` and the same length.
+    type_indices: [Int]
+    // The local-time types the file declares, in file order.
+    types: [tzzone.TzOffset]
+    // The leap-second records, read and never applied.
+    leaps: [TzifLeap]
+    // The POSIX footer string, verbatim and unparsed — `""` for a
+    // version-1 file, which has no footer. `tzposix.parse` is what
+    // turns it into a rule, and keeping the two apart means a file
+    // with an unreadable footer still yields its transition table.
+    footer: Str
+
+// One leap-second record.
+pub struct TzifLeap
+    // The UTC second at which the correction takes effect.
+    at: Int
+    // The cumulative correction from that instant on, in seconds.
+    // Cumulative rather than per-record, which is how the file writes
+    // it and how a reader must read it.
+    correction: Int
+
+// Parse a whole TZif file.
+//
+// Reads the version-2-or-later block where there is one and the
+// version-1 block otherwise, so the answer is 64-bit wherever the file
+// allows it.
+//
+// ```novo
+// use tzif
+//
+// fn main() [io]
+//     let bytes: [u8] = []
+//     match tzif.parse(bytes)
+//         Ok(d)  => println("ok")
+//         Err(_) => println("not a TZif file")
+// ```
+pub fn parse(bytes: [u8]) -> Result<TzifData, tzerr.TzError> []
+    todo("tz-nv.tzif.parse")
+
+// Parse a TZif file straight into a zone, under a name the caller
+// supplies.
+//
+// The call a host actually makes: the file has no name inside it — the
+// name is the path it was read from — so the caller passes what it
+// looked up. The footer is parsed here and attached as the zone's
+// rule, so a zone read from a file answers questions about 2400
+// exactly as a zone from the bundled pack does.
+pub fn parse_zone(bytes: [u8], name: Str) -> Result<tzzone.TzZone, tzerr.TzError> []
+    todo("tz-nv.tzif.parse_zone")
+
+// Whether the bytes begin with a TZif magic.
+//
+// A cheap test a directory walk uses: `/usr/share/zoneinfo` holds
+// `posixrules`, `zone.tab`, `leapseconds` and a `right/` subtree
+// alongside the zone files, and a walker that tried to parse all of
+// them would collect refusals it has no use for.
+pub fn is_tzif(bytes: [u8]) -> Bool []
+    todo("tz-nv.tzif.is_tzif")
+
+// The version byte, without parsing the rest.
+pub fn version_of(bytes: [u8]) -> Result<Int, tzerr.TzError> []
+    todo("tz-nv.tzif.version_of")
+
+// Read a block header at a byte offset.
+//
+// Public because a caller that wants only the footer — a tool
+// reporting which zones have future rules — can read two headers and
+// skip to the end without building any of the tables.
+pub fn read_header(bytes: [u8], offset: Int) -> Result<TzifHeader, tzerr.TzError> []
+    todo("tz-nv.tzif.read_header")
+
+// How many bytes a block described by a header occupies, header
+// included.
+//
+// What a reader adds to `offset` to reach the second block.
+pub fn block_len(h: TzifHeader) -> Int []
+    todo("tz-nv.tzif.block_len")
+
+// The byte offset of the block a reader should actually use: the
+// second block in a version-2-or-later file, the first otherwise.
+pub fn data_block_offset(bytes: [u8]) -> Result<Int, tzerr.TzError> []
+    todo("tz-nv.tzif.data_block_offset")
+
+// The POSIX footer string, unparsed, or `""` where the file has none.
+pub fn footer_of(d: TzifData) -> Str []
+    todo("tz-nv.tzif.footer_of")
+
+// The leap-second records the file carries.
+pub fn leap_seconds(d: TzifData) -> [TzifLeap] []
+    todo("tz-nv.tzif.leap_seconds")
+
+// Write a zone back out as a version-2 TZif file, into a buffer the
+// caller owns.
+//
+// Answers the written prefix; `write_len` sizes the buffer. Here
+// because a test fixture is easier to build than to find, and because
+// a tool that trims a zone's history to a window has to write the
+// result somewhere the system's own tools can read.
+pub fn write_tzif(out: [u8], z: tzzone.TzZone) -> [u8] []
+    todo("tz-nv.tzif.write_tzif")
+
+// How many bytes `write_tzif` will write.
+pub fn write_len(z: tzzone.TzZone) -> Int []
+    todo("tz-nv.tzif.write_len")

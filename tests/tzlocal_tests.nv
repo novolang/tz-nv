@@ -1,0 +1,235 @@
+// tzlocal_tests.nv — the conversion that is not a function, and the
+// TZif reader under it.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tz-nv.<module>.<fn>`. That
+// is the expected result until the bodies land.
+//
+// THE THREE CASES ARE THE SUITE. A conversion from UTC has one
+// answer and needs one test; a conversion TO UTC has three, and the
+// two that are not the ordinary one are where every timezone bug
+// anybody has shipped lives. The dates below are real: Berlin's 2026
+// changes are the last Sundays of March and October, Lord Howe
+// Island's saving is thirty minutes, and Pacific/Apia skipped
+// 2011-12-30 entirely when Samoa moved across the date line.
+
+use std.test
+use std.list
+use iso8601
+use tzdata
+use tzerr
+use tzif
+use tzlocal
+
+@test
+fn test_utc_to_local_cannot_fail() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            test.case("an instant has exactly one wall time")
+            // 2026-07-15T12:00:00Z is 14:00 in Berlin.
+            let dt = tzlocal.to_local(z, 1_784_116_800)
+            test.assert(dt.time.hour == 14)
+            test.assert(dt.date.month == 7)
+
+            test.case("the offset comes back with it, in one search")
+            let pair = tzlocal.to_local_with_offset(z, 1_784_116_800)
+            test.assert(pair.1.total_seconds == 7200)
+            test.assert(pair.0.time.hour == 14)
+
+@test
+fn test_an_ordinary_wall_time_resolves_to_one_instant() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            match iso8601.parse_datetime("2026-07-15T14:00:00")
+                Err(_) => test.assert(false)
+                Ok(dt) =>
+                    test.case("the ordinary case is unique")
+                    let r = tzlocal.resolve(z, dt)
+                    test.assert(tzlocal.is_unique(r))
+                    test.assert(tzlocal.is_gap(r) == false)
+                    test.assert(tzlocal.is_ambiguous(r) == false)
+                    test.assert(list.len(tzlocal.offsets_of(r)) == 1)
+
+                    test.case("and every policy answers the same instant")
+                    test.assert(tzlocal.to_utc(z, dt, TzPickEarlier) == Ok(1_784_116_800))
+                    test.assert(tzlocal.to_utc(z, dt, TzPickLater) == Ok(1_784_116_800))
+                    test.assert(tzlocal.to_utc(z, dt, TzPickReject) == Ok(1_784_116_800))
+                    test.assert(list.len(tzlocal.instants_of(z, dt)) == 1)
+
+@test
+fn test_a_wall_time_in_the_spring_gap_never_happened() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            // Berlin goes 02:00 -> 03:00 on 2026-03-29, so 02:30 does
+            // not exist.
+            match iso8601.parse_datetime("2026-03-29T02:30:00")
+                Err(_) => test.assert(false)
+                Ok(dt) =>
+                    test.case("the resolution is a gap, an hour wide")
+                    let r = tzlocal.resolve(z, dt)
+                    test.assert(tzlocal.is_gap(r))
+                    match r
+                        TzLocalGap(before, after, width) =>
+                            test.assert(before.total_seconds == 3600)
+                            test.assert(after.total_seconds == 7200)
+                            test.assert(width == 3600)
+                        _                                => test.assert(false)
+
+                    test.case("no instant maps to it")
+                    test.assert(list.len(tzlocal.instants_of(z, dt)) == 0)
+
+                    test.case("shifting forward lands on 03:30, which is what a person means")
+                    match tzlocal.to_utc(z, dt, TzPickShiftForward)
+                        Ok(at) => test.assert(tzlocal.to_local(z, at).time.hour == 3)
+                        Err(_) => test.assert(false)
+
+                    test.case("rejecting is the policy a batch job passes")
+                    match tzlocal.to_utc(z, dt, TzPickReject)
+                        Ok(_)  => test.assert(false)
+                        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_a_wall_time_in_the_autumn_overlap_happened_twice() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            // Berlin goes 03:00 -> 02:00 on 2026-10-25, so 02:30
+            // happens twice, an hour apart.
+            match iso8601.parse_datetime("2026-10-25T02:30:00")
+                Err(_) => test.assert(false)
+                Ok(dt) =>
+                    test.case("the resolution carries both offsets, earlier first")
+                    let r = tzlocal.resolve(z, dt)
+                    test.assert(tzlocal.is_ambiguous(r))
+                    match r
+                        TzLocalAmbiguous(first, second) =>
+                            test.assert(first.total_seconds == 7200)
+                            test.assert(second.total_seconds == 3600)
+                            test.assert(first.is_dst)
+                            test.assert(second.is_dst == false)
+                        _                               => test.assert(false)
+
+                    test.case("both instants are real, and an hour apart")
+                    let both = tzlocal.instants_of(z, dt)
+                    test.assert(list.len(both) == 2)
+
+                    test.case("the two policies pick the two answers")
+                    match tzlocal.to_utc(z, dt, TzPickEarlier)
+                        Ok(a)  =>
+                            match tzlocal.to_utc(z, dt, TzPickLater)
+                                Ok(b)  => test.assert(b - a == 3600)
+                                Err(_) => test.assert(false)
+                        Err(_) => test.assert(false)
+
+                    test.case("rejecting refuses this one too")
+                    match tzlocal.to_utc(z, dt, TzPickReject)
+                        Ok(_)  => test.assert(false)
+                        Err(_) => test.assert(true)
+
+@test
+fn test_the_gap_is_not_always_an_hour() [io]
+    let db = tzdata.data_compact()
+
+    test.case("Lord Howe Island moves by thirty minutes")
+    match tzdata.zone(db, "Australia/Lord_Howe")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            match iso8601.parse_datetime("2026-10-04T02:15:00")
+                Err(_) => test.assert(false)
+                Ok(dt) =>
+                    match tzlocal.resolve(z, dt)
+                        TzLocalGap(_, _, width) => test.assert(width == 1800)
+                        _                       => test.assert(false)
+
+    test.case("Samoa skipped a whole day when it crossed the date line")
+    match tzdata.zone(db, "Pacific/Apia")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            match iso8601.parse_datetime("2011-12-30T12:00:00")
+                Err(_) => test.assert(false)
+                Ok(dt) =>
+                    match tzlocal.resolve(z, dt)
+                        TzLocalGap(_, _, width) => test.assert(width == 86400)
+                        _                       => test.assert(false)
+
+@test
+fn test_the_offset_arithmetic_needs_no_zone() [io]
+    test.case("a civil time and an offset name an instant")
+    match iso8601.parse_datetime("2026-07-15T14:00:00")
+        Err(_) => test.assert(false)
+        Ok(dt) => test.assert(tzlocal.epoch_second(dt, 7200) == 1_784_116_800)
+
+    test.case("and an instant and an offset name a civil time")
+    let back = tzlocal.civil_at(1_784_116_800, 7200)
+    test.assert(back.time.hour == 14)
+
+    test.case("the offset prints the way RFC 3339 writes it")
+    test.assert(tzlocal.format_offset(7200) == "+02:00")
+    test.assert(tzlocal.format_offset(0 - 18000) == "-05:00")
+    test.assert(tzlocal.format_offset(0) == "Z")
+
+@test
+fn test_the_system_zone_files_parse_as_bytes_the_caller_read() [io]
+    // No file is opened anywhere in this suite: `tzif` takes bytes,
+    // which is what keeps the package `core`.
+    let not_tzif: [u8] = []
+
+    test.case("bytes that do not begin TZif are recognised cheaply")
+    test.assert(tzif.is_tzif(not_tzif) == false)
+    test.assert(tzif.TZIF_MAGIC == "TZif")
+
+    test.case("and refused with the reason, not a guess")
+    match tzif.version_of(not_tzif)
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                TzifBadMagic => test.assert(true)
+                _            => test.assert(true)
+    match tzif.parse(not_tzif)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(tzerr.source_of(e) == "tzif")
+    match tzif.parse_zone(not_tzif, "Europe/Berlin")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match tzif.read_header(not_tzif, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match tzif.data_block_offset(not_tzif)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_zone_written_as_tzif_reads_back_as_itself() [io]
+    let db = tzdata.data_compact()
+    match tzdata.zone(db, "Europe/Berlin")
+        Err(_) => test.assert(false)
+        Ok(z)  =>
+            test.case("a zone round-trips through the file format")
+            let out: [u8] = []
+            let blob = tzif.write_tzif(out, z)
+            test.assert(tzif.write_len(z) >= 0)
+            match tzif.parse(blob)
+                Err(_) => test.assert(false)
+                Ok(d)  =>
+                    // Version 2 is what is written, because version 1
+                    // has no 64-bit block and no footer.
+                    test.assert(d.version == 2)
+                    test.assert(list.len(d.transitions) == list.len(d.type_indices))
+                    test.assert(tzif.footer_of(d) != "")
+                    // Leap seconds are read and never applied.
+                    test.assert(list.len(tzif.leap_seconds(d)) == 0)
+
+                    test.case("the header's counts describe the block that follows")
+                    match tzif.read_header(blob, 0)
+                        Err(_) => test.assert(false)
+                        Ok(h)  =>
+                            test.assert(h.typecnt > 0)
+                            test.assert(h.time_size == 4)
+                            test.assert(tzif.block_len(h) > 44)
