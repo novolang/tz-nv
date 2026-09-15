@@ -1,6 +1,6 @@
 [package]
 name        = "tz-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The IANA time zone database as data a program can hold: zone lookup by name, the offset and abbreviation at an instant, UTC to local and back over calendar-nv's civil types with the gap and the overlap as an enum the caller must match, the POSIX TZ footer rule for dates past the table, and a TZif reader so a host may load the system's own zone files instead of the bundled pack.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
