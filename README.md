@@ -287,8 +287,9 @@ produces a Cortex-M4 executable.
 
 **The other five modules are not covered, and neither are the two packs.**
 `tzdata` holds the pack, `tzzone` and `tzif` build lists, and `tzlocal`
-speaks calendar-nv's civil types, which make no device claim of their
-own. 96 KB does not fit a part with 32 KB of flash to spare.
+speaks calendar-nv's civil types, which do not build for a
+microcontroller with no heap allocator either. 96 KB does not fit a
+part with 32 KB of flash to spare.
 
 One duplication follows, and it is the only one in the package.
 `tzposix.is_leap_year` repeats calendar-nv's. A probe that called into
@@ -371,8 +372,9 @@ The tests compile today and fail at run, each on the
 the expected state of an interface release. They turn green one at a
 time as bodies land.
 
-`tests/embedded_probe.nv` is not a test. It is the device claim as a
-program, and it builds. See "Running on a microcontroller".
+`tests/embedded_probe.nv` is not a test. It is the program that shows
+the seven `tzposix` functions build for a microcontroller with no heap
+allocator, and it builds. See "Running on a microcontroller".
 
 ## Implementation status
 
