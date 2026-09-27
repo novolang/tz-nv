@@ -1,32 +1,33 @@
 [package]
 name        = "tz-nv"
-version     = "0.0.2"
-description = "The IANA time zone database as data a program can hold: zone lookup by name, the offset and abbreviation at an instant, UTC to local and back over calendar-nv's civil types with the gap and the overlap as an enum the caller must match, the POSIX TZ footer rule for dates past the table, and a TZif reader so a host may load the system's own zone files instead of the bundled pack.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "The IANA time zone database as data a program can hold: zone lookup by name, the offset and abbreviation at an instant, UTC to local and back over calendar-nv's civil types with the gap and the overlap as an enum the caller must match, the POSIX TZ footer rule for dates past the table, and a TZif reader so a host may load the system's own zone files instead of the bundled pack."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet, and the tests were written against the signatures rather
+# than by a consumer.
+stability   = "experimental"
 
-# `core`.  The tzdata rules are DATA, and a lookup in them is a binary
-# search over integers: nothing is read, nothing is written, and there
-# is no clock anywhere in the package.  The two places a reader expects
-# an effect and does not find one are the two halves of the design:
+# `core`.  The tzdata rules are data, and a lookup in them is a search
+# over integers: nothing is read, nothing is written, and there is no
+# clock anywhere in the package.  Two places a reader expects an effect
+# and does not find one:
 #
-#   * the bundled pack is a byte array the package owns, not a file it
-#     opens, so `data_full()` is `[]` and stays `[]`;
-#   * `tzif` PARSES the bytes of `/usr/share/zoneinfo/Europe/Berlin`
-#     and never reads them.  The `[fs]` is the caller's, which is what
-#     lets the same reader serve a host, a firmware image with the file
-#     in flash, and a test with the bytes written in line.
+#   * the bundled packs are text the package owns, not files it opens,
+#     so `data_full()` declares no effect;
+#   * `tzif` parses the bytes of a file such as
+#     `/usr/share/zoneinfo/Europe/Berlin` and never reads them.  The
+#     `[fs]` is the caller's, so the same reader serves a host, a
+#     firmware image with the file in flash, and a test with the bytes
+#     written in line.
 #
-# It carries `tests/embedded_probe.nv`, so the device claim is BUILT.
-# `tzposix` is the half the claim covers: a POSIX TZ rule is forty
-# bytes and its transition arithmetic is integer algebra, which is what
-# a battery-powered clock with an RTC and no filesystem actually runs.
+# It carries `tests/embedded_probe.nv`, which builds `tzrule` for a
+# Cortex-M4 and checks eleven answers on it under QEMU, and
+# `tests/alloc_scan.sh`, which finds no call to the allocator in the
+# fourteen functions of `tzrule`.  A POSIX TZ rule is forty bytes and its
+# arithmetic is integers, which is what a battery clock with an RTC and
+# no filesystem runs.
 layer       = "core"
 
 category    = "time"
@@ -34,7 +35,9 @@ category    = "time"
 tags        = ["timezone", "tzdata", "iana", "zoneinfo", "tzif", "dst", "chrono-tz", "posix-tz"]
 repository  = "https://github.com/novolang/tz-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+# Lists and `Bytes` as reference types, `if let` and negative indexing
+# are all in 0.13.0.
+novo        = ">= 0.13.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -46,15 +49,8 @@ novo        = ">= 0.8.9"
 # calendar-nv, and only calendar-nv.
 #
 # The conversion this package exists for has a civil date-time on one
-# side of it, and a package that declared its own would be declaring a
-# second `CivilDateTime` that no calendar-nv function accepts — public
-# type identity is by NAME across the whole assembly, so two spellings
-# of a date are two types a consumer cannot pass between.  Taking the
-# dependency is what makes `tzlocal.resolve` composable with
-# `civil.add_days`, which is the whole of "the tzdata rules as data;
-# calendar-nv applies them".
-#
-# `^0.0.2` pins exactly 0.0.2 under the caret rule, which is what a
-# `0.0.x` range means.  calendar-nv is `core`, so the dependency is at
-# the same layer and `dep-layer` is satisfied.
-calendar-nv = "^0.0.2"
+# side of it.  A package that declared its own would declare a second
+# `CivilDateTime` that no calendar-nv function accepts, and
+# `tzlocal.resolve` would not compose with calendar-nv's `arith`.
+# calendar-nv is `core`, the same layer as this package.
+calendar-nv = "^0.2.0"

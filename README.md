@@ -12,12 +12,6 @@ string of [POSIX.1](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1
 section 8.3. [cron-nv](https://novo-lang.org/packages/cron-nv) is built
 on it.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What it is
 
 A **time zone** is a step function from instants to offsets. Give it a
@@ -49,7 +43,7 @@ There is one convention in this package and no second one.
 | Berlin in summer | 7200 |
 | Kolkata, all year | 19 800 |
 | New York in winter | -18 000 |
-| Lord Howe Island's daylight saving | 1 800, not 3 600 |
+| Lord Howe Island's daylight saving | 1 800 of saving, not 3 600 |
 | The gap Samoa skipped on 2011-12-30 | 86 400 |
 
 A **transition** is one change of offset: when it happened, and what
@@ -64,18 +58,19 @@ caller need not know which answered.
 A **link** is an alternative spelling of a zone name. `US/Eastern` is a
 link to the canonical name `America/New_York`.
 
-The database is compiled into this package as a byte array. No function
-here opens a file, reads an environment variable or consults a clock.
-Two packs are bundled.
+The database is compiled into this package as data. No function here
+opens a file, reads an environment variable or consults a clock. Two
+packs are bundled, both compiled from tzdata 2026c.
 
 | Pack | Size | What it holds |
 | --- | --- | --- |
-| `data_compact()` | about 96 KB | 340 canonical zones, 250 links, transitions from 1970 to 2038, every footer rule |
-| `data_full()` | about 310 KB | the same zones with the whole recorded history, back to the 1880s |
+| `data_compact()` | 127 057 bytes | 447 canonical zones, 151 links, the transitions from 1970 to 2038, every footer rule |
+| `data_full()` | 233 354 bytes | the same zones with the whole recorded history, back to 1834 |
 
-Those two sizes are what the design is written to. Nothing has been
-compiled yet, so they are targets and not measurements, and the release
-that implements the package reports what they came out at.
+A pack stores each zone's transitions up to the point from which its
+footer rule gives the rest, as `zic -b slim` does. `tools/build_pack.py`
+makes both packs from the system's tzdata, and it can make a pack for
+another release.
 
 Every public type is prefixed `Tz`, and every enum variant is prefixed
 too. The standard library declares `Tz` and `Zoned` in `std.time`, and
@@ -84,7 +79,7 @@ available.
 
 | Name | Value |
 | --- | --- |
-| tzdata release the packs are compiled from | `2025b` |
+| tzdata release the packs are compiled from | `2026c` |
 | First bytes of a pack | `NVTZ1` |
 | Pack layout version | 1 |
 | TZif versions read | 1, 2, 3 and 4 |
@@ -95,6 +90,8 @@ available.
 ```
 novo pkg add tz-nv
 ```
+
+tz-nv needs a novo-lang toolchain of 0.13.0 or newer.
 
 ## Example
 
@@ -132,10 +129,7 @@ fn main() [io]
         Err(m) => println(m)
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: tz-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build with `novo pkg build` and run the suites with `novo test`.
 
 ## What the package contains
 
@@ -144,9 +138,10 @@ specification the implementation will have to satisfy.
 | `tzdata` | The compiled database: the two bundled packs, a pack the caller supplies, the name lookup, the links, and the country and coordinate tables. |
 | `tzzone` | One zone, and the questions asked at a UTC instant: the offset, the abbreviation, daylight saving, and the transitions either side. |
 | `tzlocal` | The two conversions: an instant to a wall-clock time, and a wall-clock time to the instants it could mean, with the policy that picks between them. |
-| `tzposix` | The POSIX `TZ` string: parsing it, writing it, and the rule arithmetic that answers an offset from one without a database. |
+| `tzposix` | The POSIX `TZ` string: parsing it, writing it, and asking a rule about an instant. |
+| `tzrule` | The rule arithmetic under `tzposix`, in integers, for a microcontroller. |
 | `tzif` | The RFC 8536 file format, parsed from bytes the caller supplies, and written back out. |
-| `tzerr` | The ten reasons a lookup, a pack, a TZ string or a TZif file could not be read, and the byte offset of the one that stopped a parse. |
+| `tzerr` | The eleven reasons a lookup, a pack, a TZ string, a TZif file or a local-time policy refused, and the byte offset of the ones that stopped a parse. |
 
 ## How to choose an entry point
 
@@ -172,8 +167,9 @@ There are two ways to answer a question about an offset.
 
 **`tzzone` answers from a zone.** It needs a database and a heap.
 
-**`tzposix` answers from a forty-byte rule.** It needs neither. See
-"Running on a microcontroller".
+**`tzposix` answers from a forty-byte rule.** It needs no database.
+`tzrule` is the same arithmetic in integers, and it needs no heap
+either. See "Running on a microcontroller".
 
 ## The rules a user needs
 
@@ -196,10 +192,13 @@ There are two ways to answer a question about an offset.
 
    | `TzPick` | Ambiguous | Gap |
    | --- | --- | --- |
-   | `TzPickEarlier` | the earlier instant | the instant before the jump |
-   | `TzPickLater` | the later instant | the instant after the jump |
+   | `TzPickEarlier` | the earlier instant | the wall time at the offset after the jump, an instant before it |
+   | `TzPickLater` | the later instant | the wall time at the offset before the jump, an instant after it |
    | `TzPickShiftForward` | the earlier instant | 02:30 becomes 03:30 |
-   | `TzPickReject` | `Err` | `Err` |
+   | `TzPickReject` | `TzLocalRefused` | `TzLocalRefused` |
+
+   Python's `zoneinfo` answers `fold=0` as `TzPickEarlier` does in an
+   overlap and as `TzPickLater` does in a gap.
 
 6. **A gap is not always an hour.** Lord Howe Island's is 1 800 seconds
    and Samoa's skip of 2011-12-30 was 86 400 seconds wide, a whole day
@@ -214,16 +213,18 @@ There are two ways to answer a question about an offset.
    publishing a link, and a configuration file holding one stops
    working that day. `tzdata.names_for` answers the reverse, for a
    migration.
-9. **Add days in local time, then resolve.** `civil.add_days(d, 1)`
-   followed by `tzlocal.resolve(z, dt)` is what a person means by "same
-   time tomorrow". Adding 86 400 seconds to an instant is what a
+9. **Add days in local time, then resolve.** calendar-nv's
+   `arith.add_days(d, 1)` followed by `tzlocal.resolve(z, dt)` is what
+   a person means by "same time tomorrow". Adding 86 400 seconds to an instant is what a
    machine means, and across a daylight-saving change the two differ by
    an hour.
 10. **Ask `tzzone.table_covers` when the answer must be a record rather
     than an extrapolation.** Past the table's end the footer rule
     answers. Past the table's end with no footer rule, the last
-    transition's offset answers, and `table_covers` is how a caller
-    finds out that is what happened.
+    transition's offset answers, and before the table the first type
+    does. `table_covers` says whether an instant lies between the first
+    and the last transition. In the compact pack every zone's table
+    starts in 1970, so an earlier instant is an extrapolation there.
 11. **A version-2-or-later TZif file is read from its second data
     block, always.** The first block is the 32-bit original, kept for
     compatibility (RFC 8536 section 3.1 carries the version byte).
@@ -242,11 +243,10 @@ There are two ways to answer a question about an offset.
     date. POSIX.1 section 8.3 defines it.
 15. **A `Jn` rule never counts the 29th of February.** `J60` is the 1st
     of March in a leap year as well as in a common one.
-16. **`tzdata.pack_bytes` writes a short prefix rather than failing.**
-    The caller sizes the buffer with `pack_len`. A buffer that is too
-    short gives a short write, because a package that aborted on a
-    caller's arithmetic would be unusable in the firmware case it
-    exists for.
+16. **A saving is worked out, not read.** A TZif file records each
+    offset's total and a daylight flag. `TzOffset.save_seconds` is the
+    total less the offset of the standard time next to it in the table,
+    which is how Python's `zoneinfo` works it out too.
 17. **A refusal carries a byte offset, or -1 where there is no byte to
     point at.** `tzerr.offset_of` answers it, the same way
     calendar-nv's `calerror.offset_of` does. The `Error` trait that
@@ -256,10 +256,11 @@ There are two ways to answer a question about an offset.
 
 novo-lang lets a package state which of its modules can run on a device
 with no heap allocator, and the compiler checks that claim on every
-build. Here the claim covers seven functions in `tzposix` and nothing
-else: `is_leap_year`, `rule_day_of_year`, `rule_second_of_year`,
-`local_is_dst`, `offset_for`, `local_second_of_year` and `local_year`.
-All seven are integer arithmetic over numbers the caller supplies.
+build. Here the claim covers the module `tzrule` and nothing else: its
+seven functions `is_leap_year`, `rule_day_of_year`,
+`rule_second_of_year`, `local_is_dst`, `offset_for`,
+`local_second_of_year` and `local_year`. All seven are integer
+arithmetic over numbers the caller supplies.
 
 The device this is for is a battery clock with a real-time clock chip
 in it: a thermostat, a meter, a panel. It has no filesystem and no
@@ -272,27 +273,28 @@ CET-1CEST,M3.5.0,M10.5.0/3
 
 Every number in that string is an `Int` in the firmware's own flash,
 and turning it plus a clock reading into a local hour is five calls.
-The device never parses the string: `tzposix.parse` holds a `Str` and
-is the host's call, and the firmware's build or its provisioning step
-hands the integers over.
+The module comment of `tzrule` lists them. The device never parses the
+string: `tzposix.parse` holds a `Str` and is the host's call, and the
+firmware's build or its provisioning step hands the integers over.
 
-`tests/embedded_probe.nv` is the claim as a program that either builds
-or does not. It builds today:
+`tests/embedded_probe.nv` is the claim as a program.
 
 ```bash
 novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
 
-produces a Cortex-M4 executable.
+produces a Cortex-M4 executable, which prints `PASS: tz-embedded` under
+QEMU. `tests/alloc_scan.sh` reads the emitted LLVM of the fourteen
+functions in `tzrule` and finds no call to the allocator.
 
-**The other five modules are not covered, and neither are the two packs.**
-`tzdata` holds the pack, `tzzone` and `tzif` build lists, and `tzlocal`
-speaks calendar-nv's civil types, which do not build for a
-microcontroller with no heap allocator either. 96 KB does not fit a
-part with 32 KB of flash to spare.
+**The other six modules are not covered, and neither are the two packs.**
+`tzdata` holds the pack, `tzzone` and `tzif` build lists, `tzposix`
+holds strings, and `tzlocal` speaks calendar-nv's civil types, which do
+not build for a microcontroller with no heap allocator either. 127 KB
+does not fit a part with 32 KB of flash to spare.
 
 One duplication follows, and it is the only one in the package.
-`tzposix.is_leap_year` repeats calendar-nv's. A probe that called into
+`tzrule.is_leap_year` repeats calendar-nv's. A probe that called into
 calendar-nv would not link. Every other date question in this package
 goes to calendar-nv.
 
@@ -344,21 +346,28 @@ goes to calendar-nv.
 ## Tests
 
 ```bash
-novo test tests/tzdata_tests.nv      # 8 tests: the database, the lookup, a zone at an instant
-novo test tests/tzlocal_tests.nv     # 8 tests: the conversion that is not a function, and TZif
-novo test tests/tzposix_tests.nv     # 8 tests: the TZ string and the rule arithmetic
+novo test tests/tzdata_tests.nv             # 11 tests: the packs, the lookup, a zone at an instant
+novo test tests/tzzone_tests.nv             #  5 tests: a table at its edges, and a rule alone
+novo test tests/tzlocal_tests.nv            #  8 tests: the conversion that is not a function
+novo test tests/tzposix_tests.nv            # 15 tests: the TZ string and the rule arithmetic
+novo test tests/tzif_tests.nv               #  8 tests: TZif files built byte by byte
+novo test tests/tzerr_tests.nv              #  3 tests: every refusal's message, offset and source
+novo test tests/zoneinfo_vectors_tests.nv   #  4 tests: 1 900 answers from Python's zoneinfo
+bash tests/coverage.sh                      # 737 of 737 lines of src/, merged over the seven
+bash tests/alloc_scan.sh                    # nothing in tzrule allocates
 ```
 
-The reference implementations are chrono-tz and Python's `zoneinfo`,
-with the IANA database itself as the source of both the data and the
-vectors. `zdump -v` is the oracle: every instant, offset and
-abbreviation in `tests/` is what it prints for the named zone under
-tzdata 2025b. Every `TZ` string in `tests/tzposix_tests.nv` appears
-verbatim in the footer of a file under `/usr/share/zoneinfo`, and the
-expected answers are glibc's `tzset` and Go's `time`.
+The oracle is Python's `zoneinfo`, which reads the system's TZif files
+compiled from the same tzdata release. `tools/zoneinfo_vectors.py`
+asks it about twenty zones: the offset and abbreviation at 698 instants
+either side of transitions from every part of each zone's history and in
+1900, 1950, 2100 and 2400, and the UTC instants of 1 202 wall times on
+either side of and inside each jump. The answers are written into
+`tests/zoneinfo_vectors_tests.nv`, so the suite needs no Python. Both
+packs are checked against them, the compact one within 1970 to 2038.
 
-Four zones carry the cases that break implementations, and all four are
-in the suite.
+Four zones carry the cases that break implementations, and the smaller
+suites test them by name.
 
 | Zone | What it is there for |
 | --- | --- |
@@ -367,40 +376,8 @@ in the suite.
 | Australia/Lord_Howe | a thirty-minute saving |
 | Pacific/Apia | 2011-12-30, the day Samoa skipped crossing the date line |
 
-The tests compile today and fail at run, each on the
-`not implemented: tz-nv.<module>.<fn>` panic that is its body. That is
-the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-`tests/embedded_probe.nv` is not a test. It is the program that shows
-the seven `tzposix` functions build for a microcontroller with no heap
-allocator, and it builds. See "Running on a microcontroller".
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `tzdata.TZ_DATA_RELEASE`, `.TZ_PACK_MAGIC`, `.TZ_PACK_FORMAT`, `tzif.TZIF_MAGIC` | yes (they are constants) |
-| `tzdata.TzDb`, `tzzone.TzOffset`, `.TzTransition`, `.TzZone` | declared |
-| `tzlocal.TzLocal`, `.TzPick`, `tzposix.TzPosixForm`, `.TzPosixDate`, `.TzPosixRule` | declared |
-| `tzif.TzifHeader`, `.TzifData`, `.TzifLeap`, `tzerr.TzError` | declared |
-| `tzdata.data_full`, `.data_compact`, `.data_from_pack`, `.pack_bytes`, `.pack_len`, `.data_version` | no |
-| `tzdata.zone_names`, `.link_names`, `.has_zone`, `.canonical_name`, `.names_for`, `.zone` | no |
-| `tzdata.countries_of`, `.zones_in_country`, `.coordinates_of` | no |
-| `tzzone.zone_name`, `.offset_at`, `.offset_seconds_at`, `.abbrev_at`, `.is_dst_at` | no |
-| `tzzone.transition_after`, `.transition_before`, `.transitions_between`, `.transition_at`, `.transition_count` | no |
-| `tzzone.table_covers`, `.table_range`, `.table_horizon`, `.posix_rule`, `.offsets_of` | no |
-| `tzzone.fixed`, `.utc`, `.from_posix`, `.is_fixed` | no |
-| `tzlocal.to_local`, `.to_local_with_offset`, `.resolve`, `.to_utc`, `.instants_of` | no |
-| `tzlocal.is_unique`, `.is_gap`, `.is_ambiguous`, `.offsets_of` | no |
-| `tzlocal.epoch_second`, `.civil_at`, `.format_offset` | no |
-| `tzposix.parse`, `.format`, `.fixed`, `.is_fixed` | no |
-| `tzposix.offset_seconds_at`, `.is_dst_at`, `.abbrev_at`, `.next_change_after`, `.last_change_before` | no |
-| `tzposix`'s seven device functions, listed under "Running on a microcontroller" | no |
-| `tzif.parse`, `.parse_zone`, `.is_tzif`, `.version_of` | no |
-| `tzif.read_header`, `.block_len`, `.data_block_offset`, `.footer_of`, `.leap_seconds` | no |
-| `tzif.write_tzif`, `.write_len` | no |
-| `tzerr.offset_of`, `.source_of`, `TzError.message` | no |
+Every TZ string in `tests/tzposix_tests.nv` appears in the footer of a
+file under `/usr/share/zoneinfo`.
 
 ## Licence
 
