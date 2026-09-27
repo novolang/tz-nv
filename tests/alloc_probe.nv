@@ -1,0 +1,27 @@
+// tests/alloc_probe.nv — a program that reaches every function in
+// `tzrule`, so the emitted LLVM can be read for a call to the
+// allocator.
+//
+// This is not a test.  `tests/alloc_scan.sh` builds it with `--opt=0`
+// and reads the IR.  At the default optimisation level the probe inlines
+// into `novo_main`, and no function would be left to attribute an
+// allocation to.  The numbers are printed rather than checked; the
+// suites own correctness.
+
+use tzrule
+
+// Berlin's 2026 rule, through every function of the module.
+fn score(utc: Int) -> Int
+    let y = tzrule.local_year(utc, 3600)
+    let s = tzrule.local_second_of_year(utc, 3600, y)
+    let a = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 3, 5, 0, 7200, y)
+    let b = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 10, 5, 0, 10800, y) - 3600
+    let off = tzrule.offset_for(3600, 7200, tzrule.local_is_dst(a, b, s))
+    var n = off + tzrule.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, y)
+    n = n + tzrule.rule_day_of_year(TzPosixJulianLeap, 0, 0, 59, y)
+    if tzrule.is_leap_year(y)
+        n = n + 1
+    n
+
+fn main() [io]
+    println("${score(1750000000)}")

@@ -1,20 +1,16 @@
-// tzposix_tests.nv — the TZ string, and the rule arithmetic under it.
+// tests/tzposix_tests.nv — the TZ string, and the rule arithmetic
+// under it.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tz-nv.<module>.<fn>`. That
-// is the expected result until the bodies land.
-//
-// THE VECTORS ARE THE REAL STRINGS. Every TZ string below is one that
-// appears verbatim in the footer of a file in
-// `/usr/share/zoneinfo` — the four that carry the cases nobody gets
-// right the first time: a southern rule that wraps the year, a
-// half-hour offset with a numeric abbreviation, a rule whose change
-// time is outside `0 .. 24`, and a fixed zone with no dates at all.
-// glibc's `tzset` and Go's `time` both parse this set, and the answers
-// below are theirs.
+// Every TZ string below appears in the footer of a file under
+// `/usr/share/zoneinfo` in tzdata 2026c: a southern rule that wraps the
+// year, a half-hour offset with a numeric abbreviation, a change time
+// outside one day, and a fixed zone with no dates.  The expected answers
+// are the ones Python's `zoneinfo` gives for the same footers.
 
 use std.test
 use tzposix
+use tzrule
+use tzerr
 
 @test
 fn test_a_tz_string_parses_to_the_rule_it_spells() [io]
@@ -23,7 +19,7 @@ fn test_a_tz_string_parses_to_the_rule_it_spells() [io]
         Ok(r)  =>
             test.assert(r.std_abbrev == "CET")
             test.assert(r.dst_abbrev == "CEST")
-            // The string writes `-1` and means one hour EAST, because
+            // The string writes `-1` and means one hour east, because
             // POSIX reads the number as what to add to local time to
             // get UTC. Parsing flips it once, here.
             test.assert(r.std_offset_seconds == 3600)
@@ -58,11 +54,20 @@ fn test_the_change_time_is_allowed_outside_one_day() [io]
         Ok(r)  => test.assert(r.end.time_seconds == 10800)
         Err(_) => test.assert(false)
 
-    test.case("a negative change time reaches into the previous day")
-    // Chile writes `/-1`, which is 23:00 on the day before. A parser
-    // that clamped to zero would move the change by an hour.
+    test.case("a change time of 24 hours is midnight at the end of the day")
+    // Chile's rule changes at 24:00 on the first Saturday of the month,
+    // which is the start of Sunday.  A parser that stopped at 23 hours
+    // would refuse it.
     match tzposix.parse("<-04>4<-03>,M9.1.6/24,M4.1.6/24")
         Ok(r)  => test.assert(r.start.time_seconds == 86400)
+        Err(_) => test.assert(false)
+
+    test.case("a negative change time reaches into the previous day")
+    // Nuuk writes `/-1`: 23:00 on the Saturday before the last Sunday.
+    match tzposix.parse("<-02>2<-01>,M3.5.0/-1,M10.5.0/0")
+        Ok(r)  =>
+            test.assert(r.start.time_seconds == 0 - 3600)
+            test.assert(r.end.time_seconds == 0)
         Err(_) => test.assert(false)
 
 @test
@@ -95,27 +100,31 @@ fn test_week_five_means_the_last_one_and_not_the_fifth() [io]
     // Sunday in March" in every year, including the years March has
     // only four Sundays.
     test.case("the last Sunday in March 2026 is the 29th — day 87")
-    test.assert(tzposix.rule_day_of_year(TzPosixMonthWeekDay, 3, 5, 0, 2026) == 87)
+    test.assert(tzrule.rule_day_of_year(TzPosixMonthWeekDay, 3, 5, 0, 2026) == 87)
 
     test.case("the last Sunday in March 2027 is the 28th — day 86")
-    test.assert(tzposix.rule_day_of_year(TzPosixMonthWeekDay, 3, 5, 0, 2027) == 86)
+    test.assert(tzrule.rule_day_of_year(TzPosixMonthWeekDay, 3, 5, 0, 2027) == 86)
 
     test.case("the second Sunday in March 2026 is the 8th — day 66")
-    test.assert(tzposix.rule_day_of_year(TzPosixMonthWeekDay, 3, 2, 0, 2026) == 66)
+    test.assert(tzrule.rule_day_of_year(TzPosixMonthWeekDay, 3, 2, 0, 2026) == 66)
 
 @test
 fn test_the_two_julian_forms_differ_by_a_day_in_a_leap_year() [io]
-    // The mistake `TzPosixForm` exists to make unspellable: `J60` is
-    // March 1st in every year, and `60` is February 29th in a leap one.
-    test.case("J60 is March 1st in 2024 — day 59, counting from zero")
-    test.assert(tzposix.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, 2024) == 59)
+    // The mistake `TzPosixForm` exists to make unspellable.  `J60` is
+    // the 1st of March in every year.  Bare `59` is the 29th of
+    // February in a leap year and the 1st of March in a common one.
+    test.case("J60 is the 1st of March in 2024: day 60, counting from zero")
+    test.assert(tzrule.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, 2024) == 60)
 
-    test.case("bare 60 is February 29th in 2024 — day 60")
-    test.assert(tzposix.rule_day_of_year(TzPosixJulianLeap, 0, 0, 60, 2024) == 60)
+    test.case("J60 is the 1st of March in 2025 too: day 59")
+    test.assert(tzrule.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, 2025) == 59)
 
-    test.case("in a common year the two agree")
-    test.assert(tzposix.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, 2025)
-                == tzposix.rule_day_of_year(TzPosixJulianLeap, 0, 0, 59, 2025))
+    test.case("bare 59 is the 29th of February in 2024")
+    test.assert(tzrule.rule_day_of_year(TzPosixJulianLeap, 0, 0, 59, 2024) == 59)
+
+    test.case("in a common year J60 and bare 59 are the same day")
+    test.assert(tzrule.rule_day_of_year(TzPosixJulianNoLeap, 0, 0, 60, 2025)
+                == tzrule.rule_day_of_year(TzPosixJulianLeap, 0, 0, 59, 2025))
 
 @test
 fn test_the_membership_test_inverts_south_of_the_equator() [io]
@@ -123,20 +132,20 @@ fn test_the_membership_test_inverts_south_of_the_equator() [io]
     // comparison each caller writes: in Sydney the rule starts in
     // October and ends in April, so `start > end` and the test is a
     // union of two ranges rather than one.
-    let north_start = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 3, 5, 0, 7200, 2026)
-    let north_end = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 10, 5, 0, 10800, 2026)
-    let south_start = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 10, 1, 0, 7200, 2026)
-    let south_end = tzposix.rule_second_of_year(TzPosixMonthWeekDay, 4, 1, 0, 10800, 2026)
+    let north_start = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 3, 5, 0, 7200, 2026)
+    let north_end = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 10, 5, 0, 10800, 2026)
+    let south_start = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 10, 1, 0, 7200, 2026)
+    let south_end = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 4, 1, 0, 10800, 2026)
 
     test.case("July is summer time in the north and not in the south")
     let july = 15_000_000
-    test.assert(tzposix.local_is_dst(north_start, north_end, july))
-    test.assert(tzposix.local_is_dst(south_start, south_end, july) == false)
+    test.assert(tzrule.local_is_dst(north_start, north_end, july))
+    test.assert(tzrule.local_is_dst(south_start, south_end, july) == false)
 
     test.case("January is summer time in the south and not in the north")
     let january = 1_000_000
-    test.assert(tzposix.local_is_dst(north_start, north_end, january) == false)
-    test.assert(tzposix.local_is_dst(south_start, south_end, january))
+    test.assert(tzrule.local_is_dst(north_start, north_end, january) == false)
+    test.assert(tzrule.local_is_dst(south_start, south_end, january))
 
 @test
 fn test_the_rule_answers_a_zone_beyond_every_table() [io]
@@ -168,3 +177,91 @@ fn test_format_round_trips_through_parse() [io]
                     test.assert(again.start.day == r.start.day)
                 Err(_)    => test.assert(false)
         Err(_) => test.assert(false)
+
+// The offset a refusal names, or -2 when the string parsed.
+fn refused_at(s: Str) -> Int
+    match tzposix.parse(s)
+        Ok(_)  => -2
+        Err(e) => tzerr.offset_of(e)
+
+@test
+fn test_every_refusal_is_at_the_byte_it_names()
+    test.assert_eq(refused_at("<ab>1"), 3)
+    test.assert_eq(refused_at("AB1"), 2)
+    test.assert_eq(refused_at("CET25"), 3)
+    test.assert_eq(refused_at("CET-1:60"), 6)
+    test.assert_eq(refused_at("CET-1:30:61"), 9)
+    test.assert_eq(refused_at("CET"), 3)
+    test.assert_eq(refused_at("CET-1CEST,M3,M10.5.0"), 12)
+    test.assert_eq(refused_at("CET-1CEST,M3.5,M10.5.0"), 14)
+    test.assert_eq(refused_at("CET-1CEST,M3.5.0M10.5.0"), 16)
+    test.assert_eq(refused_at("CET-1CEST,M3.5.0,M10.5.0x"), 24)
+    test.assert_eq(refused_at("CET-1CEST,M3.5.7,M10.5.0"), 15)
+    test.assert_eq(refused_at("CET-1CEST,J0,J300"), 11)
+    test.assert_eq(refused_at("CET-1CEST-2"), 11)
+
+@test
+fn test_the_julian_forms_parse_and_format()
+    let r = tzposix.parse("EST5EDT,J60,300/1:30:15")!
+    test.assert_eq(r.start.day, 60)
+    test.assert_eq(r.end.day, 300)
+    test.assert_eq(r.end.time_seconds, 5415)
+    test.assert_eq(tzposix.format(r), "EST5EDT,J60,300/1:30:15")
+
+@test
+fn test_a_daylight_offset_that_is_not_one_hour_more_is_written_out()
+    // Lord Howe Island saves thirty minutes.
+    let r = tzposix.parse("<+1030>-10:30<+11>-11,M10.1.0,M4.1.0")!
+    test.assert_eq(r.dst_offset_seconds - r.std_offset_seconds, 1800)
+    test.assert_eq(tzposix.format(r), "<+1030>-10:30<+11>-11,M10.1.0,M4.1.0")
+    test.assert_eq(tzposix.format(tzposix.fixed("UTC", 0)), "UTC0")
+    test.assert_eq(tzposix.format(tzposix.fixed("+0530", 19800)), "<+0530>-5:30")
+    test.assert_eq(tzposix.format(tzposix.fixed("LMT", -1172)), "LMT0:19:32")
+    test.assert_eq(tzposix.format(tzposix.fixed("LMT", -3905)), "LMT1:05:05")
+
+@test
+fn test_a_southern_rule_answers_across_the_new_year()
+    let r = tzposix.parse("AEST-10AEDT,M10.1.0,M4.1.0/3")!
+    // 2026-01-15T00:00:00Z is summer in Sydney, 2026-07-15 winter.
+    test.assert_eq(tzposix.offset_seconds_at(r, 1768435200), 39600)
+    test.assert_eq(tzposix.abbrev_at(r, 1768435200), "AEDT")
+    test.assert_eq(tzposix.offset_seconds_at(r, 1784073600), 36000)
+    test.assert_eq(tzposix.abbrev_at(r, 1784073600), "AEST")
+    // Daylight time ends at 03:00 AEDT on 2026-04-05, 16:00 UTC the day
+    // before, and starts at 02:00 AEST on 2026-10-04.
+    test.assert_eq(tzposix.next_change_after(r, 1768435200) ?? 0, 1775318400)
+    test.assert_eq(tzposix.last_change_before(r, 1784073600) ?? 0, 1775318400)
+    test.assert_eq(tzposix.next_change_after(r, 1775318400) ?? 0, 1791043200)
+
+@test
+fn test_a_fixed_rule_has_no_changes_and_one_name()
+    let r = tzposix.fixed("IST", 19800)
+    test.assert_eq(tzposix.is_dst_at(r, 0), false)
+    test.assert_eq(tzposix.abbrev_at(r, 0), "IST")
+    test.assert_eq(tzposix.offset_seconds_at(r, 0), 19800)
+    test.assert_eq(tzposix.last_change_before(r, 0) == None, true)
+
+@test
+fn test_the_last_week_of_february_depends_on_the_year()
+    // The last Sunday in February: the 25th in 2024, a leap year, and
+    // the 23rd in 2025.
+    test.assert_eq(tzrule.rule_day_of_year(TzPosixMonthWeekDay, 2, 5, 0, 2024), 55)
+    test.assert_eq(tzrule.rule_day_of_year(TzPosixMonthWeekDay, 2, 5, 0, 2025), 53)
+    test.assert_eq(tzrule.local_year(-1, 0), 1969)
+    test.assert_eq(tzrule.local_year(951868800, 0), 2000)
+
+@test
+fn test_the_device_half_answers_berlin_from_integers()
+    // The five calls of `tzrule`'s module comment, for
+    // 2025-06-15T15:06:40Z under `CET-1CEST,M3.5.0,M10.5.0/3`.
+    test.assert_eq(tzrule.is_leap_year(2024), true)
+    test.assert_eq(tzrule.is_leap_year(1900), false)
+    test.assert_eq(tzrule.is_leap_year(2000), true)
+    let utc = 1750000000
+    let y = tzrule.local_year(utc, 3600)
+    let s = tzrule.local_second_of_year(utc, 3600, y)
+    test.assert_eq(s, 14314000)
+    let a = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 3, 5, 0, 7200, y)
+    let b = tzrule.rule_second_of_year(TzPosixMonthWeekDay, 10, 5, 0, 10800, y) - 3600
+    test.assert_eq(tzrule.offset_for(3600, 7200, tzrule.local_is_dst(a, b, s)), 7200)
+    test.assert_eq(tzrule.offset_for(3600, 7200, false), 3600)

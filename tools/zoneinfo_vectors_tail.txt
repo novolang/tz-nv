@@ -1,0 +1,105 @@
+
+// A field of a row as a number.
+fn num(s: Str) -> Int
+    str.to_int(s) ?? 0
+
+// The zone `name` in `db`, or UTC after a failed assertion.
+fn zone_or_fail(db: tzdata.TzDb, name: Str) -> tzzone.TzZone
+    match tzdata.zone(db, name)
+        Ok(z)  => z
+        Err(_) =>
+            test.fail("no zone ${name}")
+            tzzone.utc()
+
+// Check every instant row in `[lo, hi)` against `db`, and answer how
+// many were checked.
+fn check_instants(db: tzdata.TzDb, lo: Int, hi: Int) -> Int
+    var checked = 0
+    var current = ""
+    var z = tzzone.utc()
+    for line in str.split(utc_rows(), "\n")
+        let f = str.split(line, " ")
+        let t = num(f[1])
+        if t >= lo and t < hi
+            if f[0] != current
+                z = zone_or_fail(db, f[0])
+                current = f[0]
+            let o = tzzone.offset_at(z, t)
+            test.assert_eq("${f[0]} ${t} ${o.total_seconds} ${o.abbrev}", line)
+            checked = checked + 1
+    checked
+
+// The instant a policy answered, or -1 for a refusal, which neither
+// policy used here gives.
+fn instant(r: Result<Int, TzError>) -> Int
+    match r
+        Ok(u)  => u
+        Err(_) => -1
+
+// The letter a resolution is written as in the table.
+fn kind_letter(l: tzlocal.TzLocal) -> Str
+    if tzlocal.is_unique(l)
+        "U"
+    else if tzlocal.is_ambiguous(l)
+        "A"
+    else
+        "G"
+
+// Check every wall-time row in `[lo, hi)` against `db`.  `zoneinfo`'s
+// fold 0 is `TzPickEarlier` in an overlap and `TzPickLater` in a gap,
+// and fold 1 the other one.
+fn check_walls(db: tzdata.TzDb, lo: Int, hi: Int) -> Int
+    var checked = 0
+    var current = ""
+    var z = tzzone.utc()
+    for line in str.split(wall_rows(), "\n")
+        let f = str.split(line, " ")
+        let wall = num(f[1])
+        if wall >= lo and wall < hi
+            if f[0] != current
+                z = zone_or_fail(db, f[0])
+                current = f[0]
+            let dt = tzlocal.civil_at(wall, 0)
+            let kind = kind_letter(tzlocal.resolve(z, dt))
+            let earlier = instant(tzlocal.to_utc(z, dt, TzPickEarlier))
+            let later = instant(tzlocal.to_utc(z, dt, TzPickLater))
+            let fold0 = if kind == "G"
+                later
+            else
+                earlier
+            let fold1 = if kind == "G"
+                earlier
+            else
+                later
+            test.assert_eq("${f[0]} ${wall} ${kind} ${fold0} ${fold1}", line)
+            let n = if kind == "U"
+                1
+            else if kind == "A"
+                2
+            else
+                0
+            test.assert_eq(list.len(tzlocal.instants_of(z, dt)), n)
+            checked = checked + 1
+    checked
+
+@test
+fn test_the_full_pack_agrees_with_zoneinfo_at_every_instant()
+    let db = tzdata.data_full()
+    let n = check_instants(db, -9223372036854775807, 9223372036854775807)
+    test.assert_eq(n, list.len(str.split(utc_rows(), "\n")))
+
+@test
+fn test_the_compact_pack_agrees_with_zoneinfo_from_1970_to_2038()
+    let db = tzdata.data_compact()
+    test.assert(check_instants(db, 0, 2147483648) > 100)
+
+@test
+fn test_the_full_pack_resolves_every_wall_time_as_zoneinfo_does()
+    let db = tzdata.data_full()
+    let n = check_walls(db, -9223372036854775807, 9223372036854775807)
+    test.assert_eq(n, list.len(str.split(wall_rows(), "\n")))
+
+@test
+fn test_the_compact_pack_resolves_wall_times_from_1970_to_2038()
+    let db = tzdata.data_compact()
+    test.assert(check_walls(db, 86400, 2147400000) > 100)

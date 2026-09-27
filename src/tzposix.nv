@@ -1,278 +1,416 @@
-// tzposix.nv — the POSIX TZ string, and the rule arithmetic a device
-// runs instead of a database.
+// tzposix — the POSIX TZ string: reading it, writing it, and asking a
+// rule about an instant.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A POSIX TZ string such as `CET-1CEST,M3.5.0,M10.5.0/3` names a
+// standard time, a daylight time, and the two dates between which
+// daylight time is in force (POSIX.1 section 8.3).  Every version-2 TZif
+// file ends with one, its footer.  The transition table in the file
+// stops, and the footer says what the rule is after it.  A zone reader
+// that ignored the footer would answer the last table entry forever.
 //
-// WHAT A POSIX TZ STRING IS FOR, TWICE OVER.
+// The arithmetic under this module is `tzrule`'s, which also runs on a
+// microcontroller.  This module holds a `Str`, so it runs on a host.
 //
-// Once inside this package: every version-2 TZif file ends with a
-// footer line like `CET-1CEST,M3.5.0,M10.5.0/3`, and that footer is
-// how a zone answers a question about the year 2400.  The transition
-// table stops — the IANA files stop at 2037, because a 32-bit
-// `time_t` does — and the footer says what the rule becomes after it.
-// A zone reader that ignored the footer would answer the last table
-// entry forever, which is a wrong answer rather than a missing one.
+// Every offset here is seconds east of UTC, which is the opposite of the
+// sign the TZ string writes.  `CET-1` means one hour east, because POSIX
+// reads the number as what to add to local time to reach UTC.  `parse`
+// flips the sign once, and `format` flips it back.
 //
-// And once outside it: a battery clock with an RTC, four kilobytes of
-// RAM and no filesystem cannot hold the tzdata pack, and it does not
-// need to. It needs to show the right hour in ONE zone, and forty
-// bytes of TZ string plus the arithmetic below is exactly that. That
-// is what `@tier(embedded)` is claimed for here and nowhere else in
-// the package.
-//
-// THE TWO HALVES, AND THE LINE BETWEEN THEM.  numfmt-nv's `digits`
-// draws this line first and this module copies it: parsing a TZ string
-// means holding a `Str`, so `parse` is the host's call; deciding
-// whether a local second is in daylight saving is integer algebra over
-// numbers already in registers, so `in_dst` is the device's. The
-// device is handed the integers by its own build — a constant in
-// flash, or a provisioning step — and never parses anything.
-//
-// WHY THE ARITHMETIC TAKES LOOSE INTEGERS rather than a struct. A
-// `@value` struct may not be a field of a boxed struct (SPEC § 14.2),
-// so a `TzPosixRule` that held one could not exist, and a rule that
-// held only `@value` parts could not hold its two abbreviations. The
-// split that survives both rules is the one below: `TzPosixRule` is an
-// ordinary struct for the host, and the embedded entry points take the
-// four integers and the form out of it. The cost is four arguments at
-// a call site; the gain is one rule type rather than two.
-//
-// WHAT THIS IS NOT.  It is not a fallback for a zone name nobody
-// recognises: `TZ=EST5EDT` names a rule, not a place, and a program
-// that guessed one from `America/Atlantis` would be inventing history
-// it does not have. The footer extends a zone forward; it never
-// replaces one.
+// RFC 8536 section 3.3.1 extends POSIX in two ways that real footers
+// use, and both are read: an hour of a change time may run from -167 to
+// 167, and an abbreviation in angle brackets may hold digits and signs.
 
+use std.str
+use std.list
 use tzerr
+use tzrule
 
-// The three spellings POSIX gives a transition date.
-//
-// No payloads, so the enum is a scalar the embedded tier can hold and
-// `match` on — which is what lets `rule_day_of_year` be a device call
-// rather than three of them.
-pub enum TzPosixForm
-    // `Mm.w.d` — month `m`, week `w` of it, weekday `d`. Week 5 means
-    // "the last such weekday in the month", not "the fifth", and that
-    // single convention is why almost every real zone uses this form:
-    // "the last Sunday in October" has no fixed date.
-    TzPosixMonthWeekDay
-    // `Jn` — day `n` of the year, `1 ..= 365`, with February 29th
-    // NEVER counted. In a leap year `J60` is still March 1st.
-    TzPosixJulianNoLeap
-    // `n` — day `n` of the year, `0 ..= 365`, with February 29th
-    // counted. The two Julian forms differ by one day for half of
-    // every leap year, which is the mistake this enum exists to make
-    // unspellable.
-    TzPosixJulianLeap
-
-// One end of a POSIX daylight-saving rule: a date form and the local
-// time of day it takes effect.
+// One end of a daylight-saving rule: a date and the local time of day
+// the change takes effect.
 pub struct TzPosixDate
     // Which of the three spellings the numbers below are in.
     form: TzPosixForm
-    // `1 ..= 12` for `TzPosixMonthWeekDay`; `0` for the Julian forms.
+    // `1 ..= 12` for `TzPosixMonthWeekDay`, and 0 for the Julian forms.
     month: Int
-    // `1 ..= 5` for `TzPosixMonthWeekDay`, with `5` meaning last; `0`
-    // for the Julian forms.
+    // `1 ..= 5` for `TzPosixMonthWeekDay`, with 5 meaning the last, and
+    // 0 for the Julian forms.
     week: Int
-    // `0 ..= 6` for `TzPosixMonthWeekDay`, Sunday first, matching
-    // POSIX and `civil.Weekday`'s numbering offset by one. `1 ..= 365`
-    // for `TzPosixJulianNoLeap` and `0 ..= 365` for
+    // `0 ..= 6` for `TzPosixMonthWeekDay`, Sunday first as POSIX numbers
+    // it.  `1 ..= 365` for `TzPosixJulianNoLeap` and `0 ..= 365` for
     // `TzPosixJulianLeap`.
     day: Int
-    // Seconds after local midnight at which the change happens.
-    // POSIX's default is 7200 — two in the morning — and the `/3` in
-    // `M10.5.0/3` is this field written as 10800. It may be negative
-    // and it may exceed one day: `/-1` and `/25` are both legal and
-    // both occur in real zones.
+    // Seconds after local midnight at which the change happens.  The
+    // default is 7200, two in the morning, and the `/3` in `M10.5.0/3`
+    // is 10800.  It may be negative and it may exceed a day: `/-1` and
+    // `/24` both occur in real footers.
     time_seconds: Int
 
-// A whole POSIX TZ rule: the standard offset, and optionally a
-// daylight one with the two dates it runs between.
-//
-// The offsets are SECONDS EAST OF UTC, which is the sign convention
-// every other function in this package uses and the OPPOSITE of the
-// one the TZ string itself writes. `CET-1` means one hour east, and
-// the `-1` is a legacy of the string being read as "what to add to
-// local time to get UTC". Parsing flips it once, here, so nothing
-// downstream has to remember which way round it was.
+// A whole POSIX TZ rule: a standard offset, and optionally a daylight
+// one with the two dates it runs between.
 pub struct TzPosixRule
-    // `"CET"`, `"EST"`, `"<+0530>"` unwrapped to `"+0530"`.
+    // `"CET"`, `"EST"`, or `"+0530"` for the quoted `<+0530>`.
     std_abbrev: Str
     // Seconds east of UTC when daylight saving is not in force.
     std_offset_seconds: Int
-    // `false` when the string names no daylight-saving part, in which
-    // case the three fields below are not read.
+    // False when the string names no daylight time, in which case the
+    // four fields below are not read.
     has_dst: Bool
     // `"CEST"`, `"EDT"`.
     dst_abbrev: Str
-    // Seconds east of UTC while daylight saving is in force. POSIX's
-    // default when the string gives no offset is one hour more than
-    // the standard one, and parsing fills that in rather than leaving
-    // the caller to.
+    // Seconds east of UTC while daylight saving is in force.  When the
+    // string gives none it is one hour more than the standard offset,
+    // as POSIX says.
     dst_offset_seconds: Int
-    // When daylight saving begins, in LOCAL standard time.
+    // When daylight saving begins, in local standard time.
     start: TzPosixDate
-    // When it ends, in LOCAL daylight time. The two are not in the
-    // same clock, which is the subtlety `local_is_dst` handles and the
-    // reason it takes both offsets.
+    // When it ends, in local daylight time.  The two ends are read on
+    // different clocks, which is why the arithmetic below takes the
+    // saving into account at the end date.
     end: TzPosixDate
+
+// ── Parsing ─────────────────────────────────────────────────────────
+
+// The byte at `i`, or -1 past the end.
+fn at(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, -1)
+
+// Whether a byte is an ASCII letter.
+fn is_alpha(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z'
+
+// Whether a byte is an ASCII digit.
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// An abbreviation at `i`, unquoted or in angle brackets, with the
+// offset past it.
+fn read_name(s: Str, i: Int) -> Result<(Str, Int), tzerr.TzError>
+    if at(s, i) == '<'
+        var j = i + 1
+        while is_alpha(at(s, j)) or is_digit(at(s, j)) or at(s, j) == '+' or at(s, j) == '-'
+            j = j + 1
+        if at(s, j) != '>' or j - i - 1 < 3
+            return Err(TzPosixMalformed(j))
+        return Ok((str.slice(s, i + 1, j), j + 1))
+    var j = i
+    while is_alpha(at(s, j))
+        j = j + 1
+    if j - i < 3
+        return Err(TzPosixMalformed(j))
+    Ok((str.slice(s, i, j), j))
+
+// One to `width` digits at `i` as a number, with the offset past them.
+fn read_number(s: Str, i: Int, width: Int) -> Result<(Int, Int), tzerr.TzError>
+    var n = 0
+    var j = i
+    while j - i < width and is_digit(at(s, j))
+        n = n * 10 + at(s, j) - '0'
+        j = j + 1
+    if j == i
+        return Err(TzPosixMalformed(i))
+    Ok((n, j))
+
+// `[+-]hh[:mm[:ss]]` at `i` as signed seconds, the hour at most
+// `max_hours`, with the offset past it.
+fn read_hms(s: Str, i: Int, max_hours: Int) -> Result<(Int, Int), tzerr.TzError>
+    var sign = 1
+    var j = i
+    if at(s, j) == '+' or at(s, j) == '-'
+        if at(s, j) == '-'
+            sign = -1
+        j = j + 1
+    let (h, after_h) = read_number(s, j, 3)!
+    if h > max_hours
+        return Err(TzPosixMalformed(j))
+    var total = h * 3600
+    j = after_h
+    if at(s, j) == ':'
+        let (m, after_m) = read_number(s, j + 1, 2)!
+        if m > 59
+            return Err(TzPosixMalformed(j + 1))
+        total = total + m * 60
+        j = after_m
+        if at(s, j) == ':'
+            let (sec, after_s) = read_number(s, j + 1, 2)!
+            if sec > 59
+                return Err(TzPosixMalformed(j + 1))
+            total = total + sec
+            j = after_s
+    Ok((sign * total, j))
+
+// `n` read at `i` and checked against `low ..= high`, with the offset
+// past it.
+fn read_bounded(s: Str, i: Int, low: Int, high: Int) -> Result<(Int, Int), tzerr.TzError>
+    let (n, j) = read_number(s, i, 3)!
+    if n < low or n > high
+        return Err(TzPosixMalformed(i))
+    Ok((n, j))
+
+// A rule date at `i` and its optional `/time`, with the offset past it.
+fn read_date(s: Str, i: Int) -> Result<(TzPosixDate, Int), tzerr.TzError>
+    var form = TzPosixJulianLeap
+    var month = 0
+    var week = 0
+    var day = 0
+    var j = i
+    if at(s, i) == 'M'
+        let (m, after_m) = read_bounded(s, i + 1, 1, 12)!
+        if at(s, after_m) != '.'
+            return Err(TzPosixMalformed(after_m))
+        let (w, after_w) = read_bounded(s, after_m + 1, 1, 5)!
+        if at(s, after_w) != '.'
+            return Err(TzPosixMalformed(after_w))
+        let (d, after_d) = read_bounded(s, after_w + 1, 0, 6)!
+        form = TzPosixMonthWeekDay
+        month = m
+        week = w
+        day = d
+        j = after_d
+    else if at(s, i) == 'J'
+        let (n, after_n) = read_bounded(s, i + 1, 1, 365)!
+        form = TzPosixJulianNoLeap
+        day = n
+        j = after_n
+    else
+        let (n, after_n) = read_bounded(s, i, 0, 365)!
+        day = n
+        j = after_n
+    var change = 7200
+    if at(s, j) == '/'
+        let (t, after_t) = read_hms(s, j + 1, 167)!
+        change = t
+        j = after_t
+    Ok((TzPosixDate { form: form, month: month, week: week, day: day, time_seconds: change }, j))
+
+// The date POSIX uses when a rule has none: never read, because a rule
+// without dates is refused.
+fn no_date() -> TzPosixDate
+    TzPosixDate { form: TzPosixJulianLeap, month: 0, week: 0, day: 0, time_seconds: 7200 }
 
 // Parse a POSIX TZ string.
 //
-// Accepts the quoted form (`<+0530>-5:30`), the three-field time form
-// (`-4:30:00`), a missing daylight offset, a missing pair of dates
-// (which POSIX leaves implementation-defined and this reader refuses,
-// because the implementations that define it disagree), and the `J`,
-// bare-`n` and `M` date forms.
+// Reads the quoted form (`<+0530>-5:30`), an offset with minutes and
+// seconds (`-4:30:00`), a daylight time with no offset of its own, and
+// the `M`, `J` and bare-number date forms.  A daylight time with no
+// dates is refused: POSIX leaves it to the implementation, and the
+// implementations disagree.  Every refusal is `TzPosixMalformed` at the
+// byte where the reading stopped.
 //
 // ```novo
 // use tzposix
 //
 // fn main() [io]
 //     match tzposix.parse("CET-1CEST,M3.5.0,M10.5.0/3")
-//         Ok(r)  => println(r.std_abbrev)
+//         Ok(r)  => println("${r.std_abbrev} ${r.std_offset_seconds}")   // CET 3600
 //         Err(_) => println("not a TZ string")
 // ```
 pub fn parse(s: Str) -> Result<TzPosixRule, tzerr.TzError> []
-    todo("tz-nv.tzposix.parse")
+    let (std_name, after_name) = read_name(s, 0)!
+    let (west, after_off) = read_hms(s, after_name, 24)!
+    let n = str.len(s)
+    if after_off == n
+        return Ok(fixed(std_name, -west))
+    let (dst_name, after_dst) = read_name(s, after_off)!
+    var dst_off = -west + 3600
+    var j = after_dst
+    if at(s, j) != ','
+        let (dst_west, after_dst_off) = read_hms(s, j, 24)!
+        dst_off = -dst_west
+        j = after_dst_off
+    if at(s, j) != ','
+        return Err(TzPosixMalformed(j))
+    let (start, after_start) = read_date(s, j + 1)!
+    if at(s, after_start) != ','
+        return Err(TzPosixMalformed(after_start))
+    let (end, after_end) = read_date(s, after_start + 1)!
+    if after_end != n
+        return Err(TzPosixMalformed(after_end))
+    Ok(TzPosixRule {
+        std_abbrev: std_name,
+        std_offset_seconds: -west,
+        has_dst: true,
+        dst_abbrev: dst_name,
+        dst_offset_seconds: dst_off,
+        start: start,
+        end: end })
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// An abbreviation as the string writes it: bare when it is three or
+// more letters, in angle brackets otherwise.
+fn name_text(name: Str) -> Str
+    var letters = str.len(name) >= 3
+    for k in 0..str.len(name)
+        if not is_alpha(at(name, k))
+            letters = false
+    if letters
+        name
+    else
+        "<${name}>"
+
+// Signed seconds as `[-]h[:mm[:ss]]`, with the minutes and seconds only
+// when they are not zero.
+fn hms_text(v: Int) -> Str
+    let sign = if v < 0
+        "-"
+    else
+        ""
+    let a = if v < 0
+        -v
+    else
+        v
+    let h = a / 3600
+    let m = a / 60 % 60
+    let sec = a % 60
+    if sec != 0
+        "${sign}${h}:${pad2(m)}:${pad2(sec)}"
+    else if m != 0
+        "${sign}${h}:${pad2(m)}"
+    else
+        "${sign}${h}"
+
+// A number below 100 in two digits.
+fn pad2(n: Int) -> Str
+    if n < 10
+        "0${n}"
+    else
+        "${n}"
+
+// A rule date as the string writes it, with `/time` only when the time
+// is not the default two in the morning.
+fn date_text(d: TzPosixDate) -> Str
+    let head = match d.form
+        TzPosixMonthWeekDay => "M${d.month}.${d.week}.${d.day}"
+        TzPosixJulianNoLeap => "J${d.day}"
+        TzPosixJulianLeap   => "${d.day}"
+    if d.time_seconds == 7200
+        head
+    else
+        "${head}/${hms_text(d.time_seconds)}"
 
 // Write the rule back out as a POSIX TZ string.
 //
-// `parse` then `format` is not always the identity — `M10.5.0/2` comes
-// back without its default `/2`, and `<CET>` without its brackets when
-// the abbreviation needs none — but `format` then `parse` is, which is
-// the direction that matters for a footer this package writes.
+// `parse` then `format` is not always the identity: `M10.5.0/2` comes
+// back without its default `/2`, and `<CET>` without its brackets.
+// `format` then `parse` is the identity, which is the direction a footer
+// written by this package needs.
+//
+// ```novo
+// use tzposix
+//
+// fn main() [io]
+//     println(tzposix.format(tzposix.fixed("+0530", 19800)))   // <+0530>-5:30
+// ```
 pub fn format(r: TzPosixRule) -> Str []
-    todo("tz-nv.tzposix.format")
+    let std_part = "${name_text(r.std_abbrev)}${hms_text(-r.std_offset_seconds)}"
+    if not r.has_dst
+        return std_part
+    var dst_part = name_text(r.dst_abbrev)
+    if r.dst_offset_seconds != r.std_offset_seconds + 3600
+        dst_part = "${dst_part}${hms_text(-r.dst_offset_seconds)}"
+    "${std_part}${dst_part},${date_text(r.start)},${date_text(r.end)}"
 
-// A rule with no daylight-saving part: one offset, one abbreviation,
+// A rule with no daylight-saving part: one offset and one abbreviation,
 // forever.
 //
 // What `TZ=UTC0` is, and what every fixed-offset zone reduces to.
 pub fn fixed(abbrev: Str, offset_seconds: Int) -> TzPosixRule []
-    todo("tz-nv.tzposix.fixed")
+    TzPosixRule {
+        std_abbrev: abbrev,
+        std_offset_seconds: offset_seconds,
+        has_dst: false,
+        dst_abbrev: "",
+        dst_offset_seconds: offset_seconds,
+        start: no_date(),
+        end: no_date() }
 
-// Whether the rule ever changes offset.
+// Whether the rule never changes offset.
 pub fn is_fixed(r: TzPosixRule) -> Bool []
-    todo("tz-nv.tzposix.is_fixed")
+    not r.has_dst
+
+// ── Asking a rule about an instant ──────────────────────────────────
+
+// The second of year `y` at which a rule date takes effect, on the
+// clock the date is written in.
+fn date_second(d: TzPosixDate, y: Int) -> Int
+    tzrule.rule_second_of_year(d.form, d.month, d.week, d.day, d.time_seconds, y)
+
+// Whether daylight saving is in force at a UTC second under a rule
+// with daylight saving.
+fn dst_in_force(r: TzPosixRule, utc_second: Int) -> Bool
+    let std = r.std_offset_seconds
+    let y = tzrule.local_year(utc_second, std)
+    let a = date_second(r.start, y)
+    let b = date_second(r.end, y) - (r.dst_offset_seconds - std)
+    tzrule.local_is_dst(a, b, tzrule.local_second_of_year(utc_second, std, y))
 
 // The offset, in seconds east of UTC, at a UTC instant.
+//
+// ```novo
+// use tzposix
+//
+// fn main() [io]
+//     let r = tzposix.parse("CET-1CEST,M3.5.0,M10.5.0/3")!
+//     println("${tzposix.offset_seconds_at(r, 1784116800)}")   // 7200
+// ```
 pub fn offset_seconds_at(r: TzPosixRule, utc_second: Int) -> Int []
-    todo("tz-nv.tzposix.offset_seconds_at")
+    tzrule.offset_for(r.std_offset_seconds, r.dst_offset_seconds, is_dst_at(r, utc_second))
 
 // Whether daylight saving is in force at a UTC instant.
 pub fn is_dst_at(r: TzPosixRule, utc_second: Int) -> Bool []
-    todo("tz-nv.tzposix.is_dst_at")
+    r.has_dst and dst_in_force(r, utc_second)
 
 // The abbreviation in force at a UTC instant.
 pub fn abbrev_at(r: TzPosixRule, utc_second: Int) -> Str []
-    todo("tz-nv.tzposix.abbrev_at")
+    if is_dst_at(r, utc_second)
+        r.dst_abbrev
+    else
+        r.std_abbrev
 
-// The UTC second of the rule's next change strictly after `utc_second`.
+// The UTC seconds at which the rule changes in the years around
+// `utc_second`, ascending, keeping only the ones where the offset or the
+// daylight flag differs on the two sides.
 //
-// A fixed rule has none and answers `?`. A rule with dates always has
-// one, which is what makes a zone with a footer answer questions about
-// the year 2400 at all.
+// A rule that keeps daylight time all year, such as `EST5EDT,0/0,J365/25`,
+// names a change at every new year that changes nothing, and it is
+// dropped here.
+fn changes_near(r: TzPosixRule, utc_second: Int) -> [Int]
+    let std = r.std_offset_seconds
+    let dst = r.dst_offset_seconds
+    let y = tzrule.local_year(utc_second, std)
+    var found: [Int] = []
+    for year in y - 1..y + 3
+        let base = tzrule.year_start_second(year)
+        let on = base + date_second(r.start, year) - std
+        let off = base + date_second(r.end, year) - dst
+        list.push(found, on)
+        list.push(found, off)
+    list.sort(found)
+    var kept: [Int] = []
+    for c in found
+        if is_dst_at(r, c - 1) != is_dst_at(r, c)
+            list.push(kept, c)
+    kept
+
+// The UTC second of the rule's next change strictly after
+// `utc_second`.
+//
+// A fixed rule has none.  A rule with dates always has one, which is how
+// a zone with a footer answers questions about the year 2400.
 pub fn next_change_after(r: TzPosixRule, utc_second: Int) -> ?Int []
-    todo("tz-nv.tzposix.next_change_after")
+    if not r.has_dst
+        return None
+    for c in changes_near(r, utc_second)
+        if c > utc_second
+            return Some(c)
+    None
 
 // The UTC second of the rule's last change at or before `utc_second`.
 pub fn last_change_before(r: TzPosixRule, utc_second: Int) -> ?Int []
-    todo("tz-nv.tzposix.last_change_before")
-
-// ── the device half ──────────────────────────────────────────────────
-//
-// Integer algebra, every one of them. No `Str`, no list, no allocation
-// and no `Result`: a device holds the rule's numbers in its own flash
-// and asks these functions questions about them.
-//
-// A firmware clock's whole use of this package is four calls:
-//
-//   let a = tzposix.rule_second_of_year(start_form, sm, sw, sd, st, y)
-//   let b = tzposix.rule_second_of_year(end_form, em, ew, ed, et, y)
-//   let dst = tzposix.local_is_dst(a, b, sec_of_year)
-//   let off = tzposix.offset_for(std_off, dst_off, dst)
-//
-// and the RTC reading plus `off` is what goes on the display.
-
-// Whether `year` is a leap year on the proleptic Gregorian calendar.
-//
-// Duplicated from calendar-nv's `civil.is_leap_year` ON PURPOSE, and
-// this is the one duplication in the package. calendar-nv makes no
-// device claim, so a probe that called into it would not link; and the
-// rule is four lines of arithmetic that has not changed since 1582.
-// Every other date question in this package goes to calendar-nv.
-pub @tier(embedded)
-fn is_leap_year(year: Int) -> Bool []
-    todo("tz-nv.tzposix.is_leap_year")
-
-// The day of the year, counting from zero, that a rule date falls on.
-//
-// The four numbers are one `TzPosixDate`'s fields, passed loose so the
-// call has no struct in it. `month`, `week` and `day` are read
-// according to `form`, exactly as `TzPosixDate` documents them.
-//
-// This is the call that makes `M3.5.0` work: week 5 is the LAST such
-// weekday, so the answer for March 2026 is the 29th and for March 2027
-// the 28th, and neither is a date anybody wrote down.
-pub @tier(embedded)
-fn rule_day_of_year(form: TzPosixForm, month: Int, week: Int, day: Int, year: Int) -> Int []
-    todo("tz-nv.tzposix.rule_day_of_year")
-
-// The second of the year, counting from zero at local midnight on
-// January 1st, that a rule date and time falls on.
-//
-// `rule_day_of_year` times 86400 plus `time_seconds`, and the reason
-// it is a function of its own is that `time_seconds` is allowed to be
-// negative and to exceed a day: `/-1` moves the change an hour into
-// the previous day and `/25` an hour into the next, and both appear in
-// real zones. A caller that multiplied and added itself would carry
-// the sign bug.
-pub @tier(embedded)
-fn rule_second_of_year(form: TzPosixForm, month: Int, week: Int, day: Int, time_seconds: Int,
-                       year: Int) -> Int []
-    todo("tz-nv.tzposix.rule_second_of_year")
-
-// Whether a local second-of-year falls inside daylight saving, given
-// the rule's two second-of-year boundaries.
-//
-// The comparison is NOT simply `start <= s and s < end`, and that is
-// why this is a named function. In the southern hemisphere the rule
-// wraps the year end — Sydney starts daylight saving in October and
-// ends it in April, so `start > end` — and the membership test
-// inverts. A caller that wrote the comparison itself would be correct
-// in Europe and wrong in Australia, which is a bug that takes six
-// months to show up.
-pub @tier(embedded)
-fn local_is_dst(start_second: Int, end_second: Int, local_second_of_year: Int) -> Bool []
-    todo("tz-nv.tzposix.local_is_dst")
-
-// The offset to apply, given the two offsets and the answer above.
-//
-// A one-line function published because the alternative is every
-// caller writing the conditional, and half of them writing it with the
-// arms the wrong way round.
-pub @tier(embedded)
-fn offset_for(std_offset_seconds: Int, dst_offset_seconds: Int, is_dst: Bool) -> Int []
-    todo("tz-nv.tzposix.offset_for")
-
-// The second of the year a UTC second falls in, for a given offset.
-//
-// `utc_second` is seconds since 1970-01-01T00:00:00Z and `year` is the
-// year the local time falls in. The result is what `local_is_dst`
-// takes, so the three compose into "is it summer time right now" with
-// no date type anywhere.
-pub @tier(embedded)
-fn local_second_of_year(utc_second: Int, offset_seconds: Int, year: Int) -> Int []
-    todo("tz-nv.tzposix.local_second_of_year")
-
-// The year a UTC second falls in, at a given offset.
-//
-// Published because the call above needs it and a device has no
-// calendar. It is the one place this module does civil arithmetic, and
-// it does it in the narrowest form that answers the question: a year
-// number and nothing else.
-pub @tier(embedded)
-fn local_year(utc_second: Int, offset_seconds: Int) -> Int []
-    todo("tz-nv.tzposix.local_year")
+    if not r.has_dst
+        return None
+    var last: ?Int = None
+    for c in changes_near(r, utc_second)
+        if c <= utc_second
+            last = Some(c)
+    last

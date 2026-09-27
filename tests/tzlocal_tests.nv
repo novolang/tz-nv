@@ -1,20 +1,16 @@
-// tzlocal_tests.nv — the conversion that is not a function, and the
-// TZif reader under it.
+// tests/tzlocal_tests.nv — the conversion that is not a function, and
+// the TZif writer under it.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tz-nv.<module>.<fn>`. That
-// is the expected result until the bodies land.
-//
-// THE THREE CASES ARE THE SUITE. A conversion from UTC has one
-// answer and needs one test; a conversion TO UTC has three, and the
-// two that are not the ordinary one are where every timezone bug
-// anybody has shipped lives. The dates below are real: Berlin's 2026
-// changes are the last Sundays of March and October, Lord Howe
-// Island's saving is thirty minutes, and Pacific/Apia skipped
-// 2011-12-30 entirely when Samoa moved across the date line.
+// A conversion from UTC has one answer.  A conversion to UTC has three,
+// and the two that are not the ordinary one are where timezone bugs
+// live.  The dates are real: Berlin's 2026 changes are the last Sundays
+// of March and October, Lord Howe Island's saving is thirty minutes,
+// and Pacific/Apia skipped 2011-12-30 when Samoa moved across the date
+// line.
 
 use std.test
 use std.list
+use std.bytes
 use iso8601
 use tzdata
 use tzerr
@@ -92,7 +88,18 @@ fn test_a_wall_time_in_the_spring_gap_never_happened() [io]
                     test.case("rejecting is the policy a batch job passes")
                     match tzlocal.to_utc(z, dt, TzPickReject)
                         Ok(_)  => test.assert(false)
-                        Err(e) => test.assert(e.message() != "")
+                        Err(e) =>
+                            match e
+                                TzLocalRefused(zone, _, happened) =>
+                                    test.assert(zone == "Europe/Berlin")
+                                    test.assert(happened == 0)
+                                _                                 => test.assert(false)
+
+                    test.case("the earlier policy reads the wall time at the offset after the jump")
+                    match tzlocal.to_utc(z, dt, TzPickEarlier)
+                        Ok(at) => test.assert(tzlocal.to_local(z, at).time.hour == 1)
+                        Err(_) => test.assert(false)
+                    test.assert(list.len(tzlocal.offsets_of(tzlocal.resolve(z, dt))) == 2)
 
 @test
 fn test_a_wall_time_in_the_autumn_overlap_happened_twice() [io]
@@ -127,6 +134,14 @@ fn test_a_wall_time_in_the_autumn_overlap_happened_twice() [io]
                                 Ok(b)  => test.assert(b - a == 3600)
                                 Err(_) => test.assert(false)
                         Err(_) => test.assert(false)
+
+                    test.case("shifting forward in an overlap is the earlier instant")
+                    match tzlocal.to_utc(z, dt, TzPickShiftForward)
+                        Ok(a)  =>
+                            let pair = tzlocal.to_local_with_offset(z, a)
+                            test.assert(pair.1.total_seconds == 7200)
+                        Err(_) => test.assert(false)
+                    test.assert(list.len(tzlocal.offsets_of(r)) == 2)
 
                     test.case("rejecting refuses this one too")
                     match tzlocal.to_utc(z, dt, TzPickReject)
@@ -174,12 +189,20 @@ fn test_the_offset_arithmetic_needs_no_zone() [io]
     test.assert(tzlocal.format_offset(7200) == "+02:00")
     test.assert(tzlocal.format_offset(0 - 18000) == "-05:00")
     test.assert(tzlocal.format_offset(0) == "Z")
+    test.assert(tzlocal.format_offset(45900) == "+12:45")
+    // Local mean time in Amsterdam before 1937 was 1172 seconds east.
+    test.assert(tzlocal.format_offset(1172) == "+00:19:32")
+
+    test.case("an instant before 1970 names the right day")
+    let old = tzlocal.civil_at(-1, 0)
+    test.assert(old.date.year == 1969)
+    test.assert(old.time.second == 59)
 
 @test
 fn test_the_system_zone_files_parse_as_bytes_the_caller_read() [io]
     // No file is opened anywhere in this suite: `tzif` takes bytes,
     // which is what keeps the package `core`.
-    let not_tzif: [u8] = []
+    let not_tzif = bytes.zeros(0)
 
     test.case("bytes that do not begin TZif are recognised cheaply")
     test.assert(tzif.is_tzif(not_tzif) == false)
@@ -212,9 +235,8 @@ fn test_a_zone_written_as_tzif_reads_back_as_itself() [io]
         Err(_) => test.assert(false)
         Ok(z)  =>
             test.case("a zone round-trips through the file format")
-            let out: [u8] = []
-            let blob = tzif.write_tzif(out, z)
-            test.assert(tzif.write_len(z) >= 0)
+            let blob = tzif.write_tzif(z)
+            test.assert(tzif.write_len(z) == bytes.len(blob))
             match tzif.parse(blob)
                 Err(_) => test.assert(false)
                 Ok(d)  =>

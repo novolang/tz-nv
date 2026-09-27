@@ -1,211 +1,285 @@
-// tzlocal.nv — UTC to a wall clock and back, with the two answers a
-// wall clock can have.
+// tzlocal — UTC to a wall clock and back, with the three answers a wall
+// clock can have.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Converting a wall-clock time to an instant is not a function.  Twice
+// a year, in every zone that observes daylight saving, one of these is
+// true of a wall time somebody typed:
 //
-// THIS MODULE HOLDS THE LOAD-BEARING INTERFACE, `TzLocal`, and the
-// argument for it is one sentence: converting a local time to an
-// instant is not a function. Twice a year, in every zone that observes
-// daylight saving, one of these is true of a wall time somebody typed:
-//
-//   * it happened twice — 2026-10-25T02:30 in Berlin is 00:30 UTC and
-//     again at 01:30 UTC, an hour apart, both real;
-//   * it never happened — 2026-03-29T02:30 in Berlin does not exist,
+//   * it happened twice: 2026-10-25T02:30 in Berlin is 00:30 UTC and
+//     again at 01:30 UTC;
+//   * it never happened: 2026-03-29T02:30 in Berlin does not exist,
 //     because the clocks went from 02:00 to 03:00.
 //
-// An API that answered `Int` for those is an API that guessed, and the
-// guess is invisible: a calendar entry lands an hour out, a billing
-// window double-counts, a backup runs twice. `resolve` answers all
-// three cases as data and the caller decides, which is the one
-// arrangement in which the decision is written down somewhere a person
-// can read it.
+// An API that answered one `Int` for those would be guessing, and the
+// guess would not show: a calendar entry an hour out, a billing window
+// counted twice, a backup run twice.  `resolve` answers all three cases
+// as data and the caller decides.  `to_utc` takes the decision as an
+// argument, so it is written where a reviewer can read it.
 //
-// THE OTHER DIRECTION CANNOT FAIL, and the asymmetry is the design.
-// Every UTC instant has exactly one wall time in a zone, so `to_local`
-// answers a `CivilDateTime` flat — no `Result`, no enum. Only the
-// inverse is a relation.
+// The other direction cannot fail.  Every UTC instant has exactly one
+// wall time in a zone, so `to_local` answers a `CivilDateTime` with no
+// `Result` and no enum.
 //
-// WHY `to_utc` STILL ANSWERS A `Result`. Not because the conversion is
-// unreliable, but because `TzPickReject` exists: a caller processing a
-// batch of timestamps out of a file may want an ambiguous one to stop
-// the run rather than be resolved silently. The `Err` is the caller's
-// own policy coming back, and the three other policies never produce
-// one.
-//
-// WHAT THIS MODULE DOES NOT DO, and the plan's row says so: civil
-// arithmetic. Adding a day to a local time, finding the start of a
-// month, formatting — all calendar-nv's, and composed with this one by
-// the caller:
-//
-//   civil.add_days(d, 1)    then    tzlocal.resolve(z, dt)
-//
-// That order is not an accident. Adding a day in LOCAL time and then
-// resolving is what a person means by "same time tomorrow"; adding
-// 86400 seconds to an instant is what a machine means, and across a
-// daylight-saving change the two differ by an hour. Keeping the
-// arithmetic in calendar-nv and the resolution here is what makes the
-// difference something a reader can see in the code.
+// Civil arithmetic is calendar-nv's.  "The same time tomorrow" is
+// calendar-nv's `arith.add_days` on the wall time, then `resolve` here.
+// Adding 86400 seconds to an instant is what a machine means by
+// tomorrow, and across a daylight-saving change the two differ by an
+// hour.
 
+use std.list
 use civil
 use tzerr
 use tzzone
 
 // What a wall-clock time resolves to in a zone.
-//
-// THE LOAD-BEARING INTERFACE. One variant per thing that can be true
-// of a local time, each carrying what the caller needs to act on it.
 pub enum TzLocal
     // The ordinary case: one offset, one instant.
     TzLocalUnique(offset: tzzone.TzOffset)
-    // The time does not exist — the clocks jumped over it. Both
-    // offsets are carried because both are useful: `before` is what a
-    // caller shifting the time backward uses, `after` what a caller
-    // shifting it forward uses, and `gap_seconds` is how far.
+    // The time never happened: the clocks jumped over it.  `before` is
+    // the offset in force before the jump and `after` the one after it,
+    // and `gap_seconds` is the width of the jump.
     //
-    // Almost always 3600, but not always: Lord Howe Island's gap is
-    // 1800, and Samoa's skip of 2011-12-30 was 86400 seconds wide — a
-    // whole day with no wall time at all.
+    // Usually 3600, but Lord Howe Island's gap is 1800, and Samoa's skip
+    // of 2011-12-30 was 86400 seconds wide: a whole day with no wall
+    // time in it.
     TzLocalGap(before: tzzone.TzOffset, after: tzzone.TzOffset, gap_seconds: Int)
-    // The time happened twice. `first` is the earlier instant's offset
-    // and `second` the later one's, so a caller picking by wall-clock
-    // order picks by field order and cannot get it backwards.
+    // The time happened twice.  `first` is the offset of the earlier
+    // instant and `second` of the later one.
     TzLocalAmbiguous(first: tzzone.TzOffset, second: tzzone.TzOffset)
 
-// What to do with a local time that is not unique.
+// What `to_utc` does with a wall time that is not unique.
 //
-// Passed to `to_utc`, which is where the decision belongs: the
-// resolution policy for a user's calendar entry and for a log line
-// being re-parsed are different, and they are different in the same
-// program.
+// The decision belongs to the call: a user's calendar entry and a log
+// line being read back want different ones, in the same program.
 pub enum TzPick
-    // Ambiguous: take the earlier instant. Gap: take the instant the
-    // gap's start maps to, so the result is BEFORE the jump.
-    //
-    // This is what most calendars do and what a caller who has no
-    // opinion should pass.
+    // In an overlap, the earlier instant.  In a gap, the wall time read
+    // at the offset after the jump, which is the instant just before
+    // the jump.  What most calendars do.
     TzPickEarlier
-    // Ambiguous: take the later instant. Gap: take the instant the
-    // gap's end maps to, so the result is AFTER the jump.
+    // In an overlap, the later instant.  In a gap, the wall time read at
+    // the offset before the jump, which is an instant after it.
     TzPickLater
-    // Gap: shift the wall time forward by the gap's width and use the
-    // instant that lands on. `02:30` in a one-hour spring gap becomes
-    // `03:30`, which is what a person setting an alarm means and what
-    // JavaScript's `Date` and Python's `fold`-less path both do.
-    // Ambiguous: the earlier instant, as `TzPickEarlier`.
+    // In a gap, the wall time moved forward by the gap's width, so 02:30
+    // in a one-hour gap becomes 03:30.  What a person setting an alarm
+    // means.  In an overlap, the earlier instant.
     TzPickShiftForward
-    // Refuse. Both non-unique cases answer `Err`, so a batch job stops
-    // on a timestamp it cannot resolve rather than resolving it
-    // quietly.
+    // Refuse both: an overlap and a gap each answer `TzLocalRefused`.
+    // What a batch job passes when a wall time it cannot place should
+    // stop the run.
     TzPickReject
-
-// The wall-clock time at a UTC instant.
-//
-// Cannot fail, because an instant has exactly one wall time in a zone.
-//
-// ```novo
-// use iso8601
-// use tzdata
-// use tzlocal
-//
-// fn main() [io]
-//     let db = tzdata.data_compact()
-//     match tzdata.zone(db, "Europe/Berlin")
-//         Ok(z)  => println(iso8601.format_datetime(tzlocal.to_local(z, 1750000000)))
-//         Err(_) => println("no such zone")
-// ```
-pub fn to_local(z: tzzone.TzZone, utc_second: Int) -> civil.CivilDateTime []
-    todo("tz-nv.tzlocal.to_local")
-
-// The wall-clock time and the offset it was read at, together.
-//
-// The pair rather than two calls, because a caller formatting an RFC
-// 3339 string needs both and asking twice searches the table twice.
-pub fn to_local_with_offset(z: tzzone.TzZone,
-                            utc_second: Int) -> (civil.CivilDateTime, tzzone.TzOffset) []
-    todo("tz-nv.tzlocal.to_local_with_offset")
-
-// What a wall-clock time resolves to in this zone.
-//
-// The call that makes the design hold. Cannot fail: a gap and an
-// overlap are answers, not errors.
-//
-// ```novo
-// use iso8601
-// use tzdata
-// use tzlocal
-//
-// fn main() [io]
-//     let db = tzdata.data_compact()
-//     match tzdata.zone(db, "Europe/Berlin")
-//         Ok(z)  =>
-//             match iso8601.parse_datetime("2026-10-25T02:30:00")
-//                 Ok(dt) =>
-//                     match tzlocal.resolve(z, dt)
-//                         TzLocalUnique(_)         => println("once")
-//                         TzLocalGap(_, _, _)      => println("never")
-//                         TzLocalAmbiguous(_, _)   => println("twice")
-//                 Err(_) => println("not a date-time")
-//         Err(_) => println("no such zone")
-// ```
-pub fn resolve(z: tzzone.TzZone, local: civil.CivilDateTime) -> TzLocal []
-    todo("tz-nv.tzlocal.resolve")
-
-// A wall-clock time as a UTC instant, under a policy.
-//
-// `Err` only under `TzPickReject`, and then only for a time that is
-// genuinely not unique — so a caller that passes any other policy may
-// read the `Ok` without a second thought.
-pub fn to_utc(z: tzzone.TzZone, local: civil.CivilDateTime,
-              pick: TzPick) -> Result<Int, tzerr.TzError> []
-    todo("tz-nv.tzlocal.to_utc")
-
-// Every UTC instant a wall-clock time maps to, earliest first.
-//
-// Empty for a time in a gap, one element for the ordinary case, two
-// for an overlap. The shape a caller iterates when it wants to act on
-// all of them — a reminder that should fire both times an hour repeats
-// is a real requirement, and `to_utc` cannot express it.
-pub fn instants_of(z: tzzone.TzZone, local: civil.CivilDateTime) -> [Int] []
-    todo("tz-nv.tzlocal.instants_of")
-
-// Whether the resolution is the ordinary one.
-pub fn is_unique(l: TzLocal) -> Bool []
-    todo("tz-nv.tzlocal.is_unique")
-
-// Whether the wall time never happened.
-pub fn is_gap(l: TzLocal) -> Bool []
-    todo("tz-nv.tzlocal.is_gap")
-
-// Whether the wall time happened twice.
-pub fn is_ambiguous(l: TzLocal) -> Bool []
-    todo("tz-nv.tzlocal.is_ambiguous")
-
-// The offsets a resolution carries, earliest first: one for a unique
-// time, two for a gap or an overlap.
-pub fn offsets_of(l: TzLocal) -> [tzzone.TzOffset] []
-    todo("tz-nv.tzlocal.offsets_of")
-
-// The UTC instant a civil date-time and an offset name.
-//
-// The arithmetic under everything above, published because a caller
-// that already knows the offset — from a stored `+02:00`, from an RFC
-// 3339 string calendar-nv parsed — has no zone to look it up in and
-// should not have to build one.
-pub fn epoch_second(dt: civil.CivilDateTime, offset_seconds: Int) -> Int []
-    todo("tz-nv.tzlocal.epoch_second")
 
 // The civil date-time a UTC instant and an offset name.
 //
-// The inverse of `epoch_second`, and the only conversion in this
-// package that needs no zone at all.
-pub fn civil_at(utc_second: Int, offset_seconds: Int) -> civil.CivilDateTime []
-    todo("tz-nv.tzlocal.civil_at")
-
-// The offset formatted the way RFC 3339 writes it: `"+02:00"`,
-// `"-05:00"`, `"Z"` for zero.
+// The inverse of `epoch_second`, and a conversion that needs no zone.
 //
-// Here rather than in calendar-nv because the sign and the minutes
-// come off a `TzOffset`, and calendar-nv's `format_rfc3339` already
-// takes the number of minutes — this is what a caller passes it.
+// ```novo
+// use tzlocal
+//
+// fn main() [io]
+//     println("${tzlocal.civil_at(1784116800, 7200).time.hour}")   // 14
+// ```
+pub fn civil_at(utc_second: Int, offset_seconds: Int) -> civil.CivilDateTime []
+    let local = utc_second + offset_seconds
+    var days = local / 86400
+    if local % 86400 < 0
+        days = days - 1
+    let sod = local - days * 86400
+    let t = CivilTime { hour: sod / 3600, minute: sod / 60 % 60, second: sod % 60, nano: 0 }
+    civil.datetime(civil.date_from_epoch_day(days), t)
+
+// The UTC instant a civil date-time and an offset name.
+//
+// For a caller that already knows the offset, from a stored `+02:00` or
+// an RFC 3339 string, and has no zone to look it up in.  The
+// nanoseconds of the time are dropped.
+//
+// ```novo
+// use iso8601
+// use tzlocal
+//
+// fn main() [io]
+//     let dt = iso8601.parse_datetime("2026-07-15T14:00:00")!
+//     println("${tzlocal.epoch_second(dt, 7200)}")   // 1784116800
+// ```
+pub fn epoch_second(dt: civil.CivilDateTime, offset_seconds: Int) -> Int []
+    let t = dt.time
+    civil.epoch_day(dt.date) * 86400 + t.hour * 3600 + t.minute * 60 + t.second - offset_seconds
+
+// The wall-clock time at a UTC instant.
+//
+// ```novo
+// use iso8601
+// use tzdata
+// use tzlocal
+//
+// fn main() [io]
+//     let z = tzdata.zone(tzdata.data_compact(), "Europe/Berlin")!
+//     println(iso8601.format_datetime(tzlocal.to_local(z, 1750000000)))   // 2025-06-15T17:06:40
+// ```
+pub fn to_local(z: tzzone.TzZone, utc_second: Int) -> civil.CivilDateTime []
+    civil_at(utc_second, tzzone.offset_seconds_at(z, utc_second))
+
+// The wall-clock time and the offset it was read at, together.
+//
+// A caller writing an RFC 3339 string needs both, and one call searches
+// the table once.
+pub fn to_local_with_offset(z: tzzone.TzZone,
+                            utc_second: Int) -> (civil.CivilDateTime, tzzone.TzOffset) []
+    let o = tzzone.offset_at(z, utc_second)
+    (civil_at(utc_second, o.total_seconds), o)
+
+// The instants within two days either side of wall time `wall`, read
+// as if it were UTC, at which some offset in force there maps back to
+// `wall`, ascending.
+fn matches(z: tzzone.TzZone, wall: Int) -> [Int]
+    var offsets: [Int] = [tzzone.offset_seconds_at(z, wall)]
+    for tr in tzzone.transitions_between(z, wall - 172800, wall + 172800)
+        list.push(offsets, tr.before.total_seconds)
+        list.push(offsets, tr.after.total_seconds)
+    var found: [Int] = []
+    for o in offsets
+        let u = wall - o
+        if tzzone.offset_seconds_at(z, u) == o and not list.contains(found, u)
+            list.push(found, u)
+    list.sort(found)
+    found
+
+// The transition whose jump forward covers wall time `wall`.  Only
+// asked when `wall` names no instant, so one exists.
+fn gap_of(z: tzzone.TzZone, wall: Int) -> TzLocal
+    var result = TzLocalGap(tzzone.offset_at(z, wall), tzzone.offset_at(z, wall), 0)
+    for tr in tzzone.transitions_between(z, wall - 172800, wall + 172800)
+        let start = tr.at + tr.before.total_seconds
+        let end = tr.at + tr.after.total_seconds
+        if start <= wall and wall < end
+            result = TzLocalGap(tr.before, tr.after, end - start)
+    result
+
+// What a wall-clock time resolves to in this zone.
+//
+// Cannot fail: a gap and an overlap are answers, not errors.  The
+// nanoseconds of the time do not change the answer.
+//
+// ```novo
+// use iso8601
+// use tzdata
+// use tzlocal
+//
+// fn main() [io]
+//     let z = tzdata.zone(tzdata.data_compact(), "Europe/Berlin")!
+//     let dt = iso8601.parse_datetime("2026-10-25T02:30:00")!
+//     match tzlocal.resolve(z, dt)
+//         TzLocalUnique(_)       => println("once")
+//         TzLocalGap(_, _, _)    => println("never")
+//         TzLocalAmbiguous(_, _) => println("twice")   // twice
+// ```
+pub fn resolve(z: tzzone.TzZone, local: civil.CivilDateTime) -> TzLocal []
+    let wall = epoch_second(local, 0)
+    let found = matches(z, wall)
+    let n = list.len(found)
+    if n == 0
+        gap_of(z, wall)
+    else if n == 1
+        TzLocalUnique(tzzone.offset_at(z, found[0]))
+    else
+        TzLocalAmbiguous(tzzone.offset_at(z, found[0]), tzzone.offset_at(z, found[-1]))
+
+// A wall-clock time as a UTC instant, under a policy.
+//
+// `Err` only under `TzPickReject`, and then only for a wall time that is
+// not unique, so a caller passing any other policy can read the `Ok`.
+// The table on `TzPick` says what each policy answers.
+pub fn to_utc(z: tzzone.TzZone, local: civil.CivilDateTime,
+              pick: TzPick) -> Result<Int, tzerr.TzError> []
+    let wall = epoch_second(local, 0)
+    match resolve(z, local)
+        TzLocalUnique(o)                => Ok(wall - o.total_seconds)
+        TzLocalAmbiguous(first, second) => pick_overlap(z, wall, first, second, pick)
+        TzLocalGap(before, after, _)    => pick_gap(z, wall, before, after, pick)
+
+// The instant a policy picks in an overlap.
+fn pick_overlap(z: tzzone.TzZone, wall: Int, first: tzzone.TzOffset, second: tzzone.TzOffset,
+                pick: TzPick) -> Result<Int, tzerr.TzError>
+    match pick
+        TzPickLater  => Ok(wall - second.total_seconds)
+        TzPickReject => Err(TzLocalRefused(z.name, wall, 2))
+        _            => Ok(wall - first.total_seconds)
+
+// The instant a policy picks in a gap.
+fn pick_gap(z: tzzone.TzZone, wall: Int, before: tzzone.TzOffset, after: tzzone.TzOffset,
+            pick: TzPick) -> Result<Int, tzerr.TzError>
+    match pick
+        TzPickEarlier => Ok(wall - after.total_seconds)
+        TzPickReject  => Err(TzLocalRefused(z.name, wall, 0))
+        _             => Ok(wall - before.total_seconds)
+
+// Every UTC instant a wall-clock time names, earliest first.
+//
+// Empty in a gap, one instant in the ordinary case, two in an overlap.
+// A reminder that should fire both times an hour repeats is built on
+// this, and `to_utc` cannot express it.
+pub fn instants_of(z: tzzone.TzZone, local: civil.CivilDateTime) -> [Int] []
+    matches(z, epoch_second(local, 0))
+
+// Whether the resolution is the ordinary one.
+pub fn is_unique(l: TzLocal) -> Bool []
+    match l
+        TzLocalUnique(_) => true
+        _                => false
+
+// Whether the wall time never happened.
+pub fn is_gap(l: TzLocal) -> Bool []
+    match l
+        TzLocalGap(_, _, _) => true
+        _                   => false
+
+// Whether the wall time happened twice.
+pub fn is_ambiguous(l: TzLocal) -> Bool []
+    match l
+        TzLocalAmbiguous(_, _) => true
+        _                      => false
+
+// The offsets a resolution carries: one for a unique time, and two for
+// a gap or an overlap, earlier first.
+pub fn offsets_of(l: TzLocal) -> [tzzone.TzOffset] []
+    match l
+        TzLocalUnique(o)       => [o]
+        TzLocalGap(a, b, _)    => [a, b]
+        TzLocalAmbiguous(a, b) => [a, b]
+
+// The offset written the way RFC 3339 writes it: `"+02:00"`,
+// `"-05:00"`, and `"Z"` for zero.
+//
+// RFC 3339 has no seconds in an offset.  An offset with seconds, which
+// only local mean time before the 20th century has, is written with
+// them, `"+00:53:28"`, rather than rounded.
+//
+// ```novo
+// use tzlocal
+//
+// fn main() [io]
+//     println(tzlocal.format_offset(-18000))   // -05:00
+// ```
 pub fn format_offset(offset_seconds: Int) -> Str []
-    todo("tz-nv.tzlocal.format_offset")
+    if offset_seconds == 0
+        return "Z"
+    let sign = if offset_seconds < 0
+        "-"
+    else
+        "+"
+    let a = if offset_seconds < 0
+        -offset_seconds
+    else
+        offset_seconds
+    let hm = "${sign}${pad2(a / 3600)}:${pad2(a / 60 % 60)}"
+    if a % 60 == 0
+        hm
+    else
+        "${hm}:${pad2(a % 60)}"
+
+// A number below 100 in two digits.
+fn pad2(n: Int) -> Str
+    if n < 10
+        "0${n}"
+    else
+        "${n}"

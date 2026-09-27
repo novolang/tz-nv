@@ -1,0 +1,183 @@
+// tests/tzif_tests.nv — the TZif reader and writer over files built in
+// this suite, byte by byte, as RFC 8536 section 3 lays them out.
+//
+// Two files carry the shapes: a version-1 file with 32-bit times and a
+// leap-second record, and a version-3 file whose first block is empty
+// and whose second block has 64-bit times, a leap-second record and a
+// footer.  The refusals are each of those files with one field wrong.
+
+use std.test
+use std.bytes
+use std.list
+use tzif
+use tzerr
+use tzzone
+
+// The number a call answered, or -1 for a refusal.
+fn ok_int(r: Result<Int, TzError>) -> Int
+    match r
+        Ok(n)  => n
+        Err(_) => -1
+
+// A block header: the magic, the version byte, fifteen zero bytes and
+// the six counts.
+fn header(version: Int, isut: Int, isstd: Int, leap: Int, times: Int, types: Int,
+          chars: Int) -> Bytes
+    bytes.concat([bytes.from_str("TZif"), bytes.u8(version), bytes.zeros(15), bytes.u32_be(isut),
+                  bytes.u32_be(isstd), bytes.u32_be(leap), bytes.u32_be(times), bytes.u32_be(types),
+                  bytes.u32_be(chars)])
+
+// A local-time type record.
+fn ttinfo(utoff: Int, isdst: Int, desig: Int) -> Bytes
+    bytes.concat([bytes.u32_be(utoff), bytes.u8(isdst), bytes.u8(desig)])
+
+// Two transitions, into standard time in 1970 and into summer time in
+// 1980, two types, one leap second in 1972 and the two indicator arrays.
+fn version_one_body() -> Bytes
+    bytes.concat([bytes.u32_be(-1), bytes.u32_be(323830800), bytes.u8(0), bytes.u8(1),
+                  ttinfo(3600, 0, 0), ttinfo(7200, 1, 4), bytes.from_str("CET"), bytes.zeros(1),
+                  bytes.from_str("CEST"), bytes.zeros(1), bytes.u32_be(78796800), bytes.u32_be(1),
+                  bytes.zeros(2), bytes.zeros(2)])
+
+// A version-1 file.
+fn version_one() -> Bytes
+    bytes.concat([header(0, 2, 2, 1, 2, 2, 9), version_one_body()])
+
+// A version-3 file: an empty first block, then 64-bit times, a leap
+// second, and `footer` between newlines.
+fn version_three(footer: Str) -> Bytes
+    bytes.concat([header('3', 0, 0, 0, 0, 1, 4), ttinfo(0, 0, 0), bytes.from_str("UTC"), bytes.zeros(1),
+                  header('3', 0, 0, 1, 1, 2, 9), bytes.u64_be(-2208988800), bytes.u8(1),
+                  ttinfo(3208, 0, 0), ttinfo(3600, 0, 4), bytes.from_str("LMT"), bytes.zeros(1),
+                  bytes.from_str("CET"), bytes.zeros(1), bytes.zeros(1), bytes.u64_be(78796800),
+                  bytes.u32_be(1), bytes.from_str("\n${footer}\n")])
+
+@test
+fn test_a_version_one_file_is_read_from_its_only_block()
+    test.assert_eq(tzif.is_tzif(version_one()), true)
+    test.assert_eq(ok_int(tzif.version_of(version_one())), 1)
+    test.assert_eq(ok_int(tzif.data_block_offset(version_one())), 0)
+    match tzif.parse(version_one())
+        Err(_) => test.fail("a version-1 file")
+        Ok(d)  =>
+            test.assert_eq(d.version, 1)
+            test.assert_eq(d.transitions, [-1, 323830800])
+            test.assert_eq(d.type_indices, [0, 1])
+            test.assert_eq(d.types[1].abbrev, "CEST")
+            test.assert_eq(d.types[1].save_seconds, 3600)
+            test.assert_eq(tzif.footer_of(d), "")
+            let leaps = tzif.leap_seconds(d)
+            test.assert_eq(leaps[0].at, 78796800)
+            test.assert_eq(leaps[0].correction, 1)
+    match tzif.parse_zone(version_one(), "Test/One")
+        Err(_) => test.fail("a version-1 file")
+        Ok(z)  =>
+            // No footer, so the last type holds after the table.
+            test.assert_eq(tzzone.posix_rule(z) == None, true)
+            test.assert_eq(tzzone.offset_seconds_at(z, 2000000000), 7200)
+
+@test
+fn test_a_version_three_file_is_read_from_its_second_block()
+    let file = version_three("CET-1")
+    test.assert_eq(ok_int(tzif.version_of(file)), 3)
+    let first = tzif.read_header(file, 0)!
+    test.assert_eq(first.time_size, 4)
+    test.assert_eq(tzif.block_len(first), 54)
+    test.assert_eq(ok_int(tzif.data_block_offset(file)), 54)
+    let second = tzif.read_header(file, 54)!
+    test.assert_eq(second.time_size, 8)
+    test.assert_eq(second.leapcnt, 1)
+    test.assert_eq(second.data_offset, 98)
+    match tzif.parse(file)
+        Err(_) => test.fail("a version-3 file")
+        Ok(d)  =>
+            test.assert_eq(d.version, 3)
+            test.assert_eq(d.transitions, [-2208988800])
+            test.assert_eq(d.types[0].abbrev, "LMT")
+            test.assert_eq(tzif.footer_of(d), "CET-1")
+            test.assert_eq(tzif.leap_seconds(d)[0].at, 78796800)
+    match tzif.parse_zone(file, "Test/Three")
+        Err(_) => test.fail("a version-3 file")
+        Ok(z)  =>
+            test.assert_eq(tzzone.offset_seconds_at(z, -3000000000), 3208)
+            test.assert_eq(tzzone.abbrev_at(z, 0), "CET")
+
+@test
+fn test_a_footer_that_does_not_parse_leaves_the_table_readable()
+    let file = version_three("C1")
+    match tzif.parse(file)
+        Ok(d)  => test.assert_eq(tzif.footer_of(d), "C1")
+        Err(_) => test.fail("the table is readable")
+    match tzif.parse_zone(file, "Test/Bad")
+        Ok(_)  => test.fail("the footer is not a rule")
+        Err(e) => test.assert_eq(tzerr.source_of(e), "posix")
+
+@test
+fn test_a_file_that_ends_after_its_second_block_has_no_footer()
+    let file = version_three("CET-1")
+    let cut = bytes.slice(file, 0, bytes.len(file) - 7)
+    match tzif.parse(cut)
+        Ok(d)  => test.assert_eq(tzif.footer_of(d), "")
+        Err(_) => test.fail("the block is whole")
+
+@test
+fn test_every_refusal_names_what_was_wrong()
+    match tzif.parse(bytes.from_str("TZXf0000000000000000"))
+        Ok(_)  => test.fail("bad magic")
+        Err(e) => test.assert_eq(tzerr.offset_of(e), 0)
+    match tzif.version_of(bytes.from_str("TZif9"))
+        Ok(_)  => test.fail("version 9")
+        Err(e) =>
+            match e
+                TzifUnsupportedVersion(v) => test.assert_eq(v, '9')
+                _                         => test.fail("expected TzifUnsupportedVersion")
+    match tzif.read_header(bytes.from_str("TZif2"), 0)
+        Ok(_)  => test.fail("a header is 44 bytes")
+        Err(e) =>
+            match e
+                TzifTruncated(at, needed, had) => test.assert_eq([at, needed, had], [0, 44, 5])
+                _                              => test.fail("expected TzifTruncated")
+    match tzif.parse(header(0, 0, 0, 0, 0, 0, 0))
+        Ok(_)  => test.fail("no types")
+        Err(e) => test.assert_eq(tzerr.source_of(e), "tzif")
+    let short = bytes.slice(version_one(), 0, 60)
+    match tzif.parse(short)
+        Ok(_)  => test.fail("the data ends early")
+        Err(e) =>
+            match e
+                TzifTruncated(at, needed, had) => test.assert_eq([at, needed, had], [44, 43, 16])
+                _                              => test.fail("expected TzifTruncated")
+    let bad_index = bytes.concat([header(0, 0, 0, 0, 1, 1, 4), bytes.u32_be(0), bytes.u8(3),
+                                  ttinfo(0, 0, 0), bytes.from_str("UTC"), bytes.zeros(1)])
+    match tzif.parse(bad_index)
+        Ok(_)  => test.fail("type 3 of 1")
+        Err(e) =>
+            match e
+                TzifTypeIndexOutOfRange(i, n) => test.assert_eq([i, n], [3, 1])
+                _                             => test.fail("expected TzifTypeIndexOutOfRange")
+
+@test
+fn test_an_abbreviation_index_at_a_nul_is_an_empty_name()
+    let file = bytes.concat([header(0, 0, 0, 0, 0, 1, 1), ttinfo(0, 0, 0), bytes.zeros(1)])
+    match tzif.parse(file)
+        Ok(d)  => test.assert_eq(d.types[0].abbrev, "")
+        Err(_) => test.fail("an empty abbreviation")
+
+@test
+fn test_an_abbreviation_with_no_nul_ends_at_the_table()
+    let file = bytes.concat([header(0, 0, 0, 0, 0, 1, 3), ttinfo(0, 0, 0), bytes.from_str("UTC")])
+    match tzif.parse(file)
+        Ok(d)  => test.assert_eq(d.types[0].abbrev, "UTC")
+        Err(_) => test.fail("an abbreviation that fills the table")
+
+@test
+fn test_a_zone_with_no_rule_is_written_with_an_empty_footer()
+    let file = tzif.write_tzif(tzzone.fixed("Test/Fixed", 19800, "IST"))
+    test.assert_eq(tzif.write_len(tzzone.fixed("Test/Fixed", 19800, "IST")), bytes.len(file))
+    match tzif.parse(file)
+        Ok(d)  =>
+            test.assert_eq(d.version, 2)
+            test.assert_eq(tzif.footer_of(d), "")
+            test.assert_eq(d.types[0].total_seconds, 19800)
+            test.assert_eq(list.len(d.transitions), 0)
+        Err(_) => test.fail("a written file reads back")

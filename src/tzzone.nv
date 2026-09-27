@@ -1,73 +1,51 @@
-// tzzone.nv — one zone, and the questions asked at a UTC instant.
+// tzzone — one zone, and the questions asked of it at a UTC instant.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A zone is a step function from instants to offsets.  Give it a UTC
+// second and it answers how far east of UTC the wall clocks were, what
+// the offset was called, and whether daylight saving was in force.
+// Exactly one offset is in force at any UTC second, so no call here
+// fails and none answers a `Result`.  The inverse, a wall time to the
+// instants it names, is not a function, and it is `tzlocal`'s.
 //
-// A ZONE IS A STEP FUNCTION FROM INSTANTS TO OFFSETS, and that is the
-// whole of it. Give it a UTC second and it answers how far east of UTC
-// the wall clocks were, what people called that offset, and whether
-// daylight saving was in force. Everything harder — a local time that
-// happened twice, a local time that never happened — is the INVERSE of
-// this function, and the inverse is `tzlocal`'s, because the inverse
-// is not a function at all.
+// A zone answers from its transition table where the table reaches,
+// and from its POSIX footer rule past the end of it.  A caller who needs
+// to tell a record from an extrapolation asks `table_covers`.
 //
-// WHY THE QUESTIONS ARE ASKED AT AN INSTANT AND NOT AT A DATE. An
-// instant is unambiguous by construction: there is exactly one offset
-// in force at a given UTC second, in every zone, forever. So this
-// module cannot fail and none of its calls answer a `Result`. The one
-// thing that can go wrong — an instant past the end of the table in a
-// zone with no footer rule — is settled at zone construction instead,
-// by `table_covers` and `posix_rule` being readable facts rather than
-// surprises.
+// Every offset is in seconds east of UTC: Berlin in winter is 3600,
+// Kolkata 19800, New York in winter -18000.
 //
-// THE TRANSITION TABLE AND THE FOOTER ARE ONE SURFACE. A zone answers
-// from its table where the table reaches, and from its POSIX footer
-// rule past the end of it, and a caller never has to know which
-// answered. What a caller CAN know, and sometimes needs to, is
-// `table_covers`: an archival application converting a 1901 timestamp
-// wants to be told the answer is an extrapolation rather than a
-// record.
-//
-// SECONDS EAST OF UTC, EVERYWHERE, with no exception and no second
-// convention. Berlin in winter is `3600`. Kolkata is `19800`. New York
-// in winter is `-18000`. The POSIX TZ string's opposite convention is
-// flipped once, inside `tzposix.parse`, and never appears here.
+// A TZif file records an offset and a daylight flag for each local-time
+// type, and not the saving.  `build` recovers the saving the way
+// Python's `zoneinfo` does: a daylight type's saving is its offset less
+// the offset of the standard type next to it in the table.
 
+use std.list
 use tzerr
 use tzposix
+use tzrule
 
-// The offset in force at some instant, with the two facts a caller
-// prints beside it.
-//
-// Not `@value`, deliberately: `abbrev` is a `Str`, and a `@value`
-// struct holds scalars only. It is also an enum payload in
-// `tzlocal.TzLocal`, which a `@value` struct may not be (SPEC § 14.5),
-// so the choice is forced twice over. The device half of this package
-// answers loose integers instead, in `tzposix`.
+// The offset in force at some instant, with the facts printed beside
+// it.
 pub struct TzOffset
-    // The total offset east of UTC, in seconds: standard plus save.
-    // This is the number added to a UTC instant to get a wall clock.
+    // The total offset east of UTC, in seconds: standard plus saving.
+    // A UTC second plus this number is the wall-clock second.
     total_seconds: Int
-    // The standard component on its own.
+    // The standard part on its own.
     standard_seconds: Int
-    // The daylight-saving component: `0` outside it, usually `3600`
-    // inside, and `1800` in Lord Howe Island, which is the reason this
-    // is a number rather than a flag.
+    // The daylight-saving part: 0 outside it, usually 3600 inside, 1800
+    // on Lord Howe Island and 7200 at Troll in Antarctica.
     save_seconds: Int
     // What the offset is called: `"CET"`, `"CEST"`, `"IST"`, or a
-    // numeric form like `"+0530"` where the zone has no name for it.
-    // IANA stopped inventing abbreviations in 2017, so numeric forms
-    // are the common case for new zones rather than the exception.
+    // numeric form such as `"+0530"` where the zone has no name for it.
     abbrev: Str
-    // Whether daylight saving is in force. `save_seconds != 0` for
-    // every zone in the database today, but the two are separate
-    // fields because the TZif format carries them separately and a
-    // reader that collapsed them would be deciding for the file.
+    // Whether daylight saving is in force.  A TZif file carries this
+    // flag on its own, and it is kept as the file wrote it.
     is_dst: Bool
 
-// One change of offset: when it happened, and what it was on each side.
+// One change of offset: when it happened, and the offset on each side.
 pub struct TzTransition
-    // The UTC second at which the new offset takes effect. The first
-    // instant AT the new offset, not the last one at the old.
+    // The UTC second at which the new offset takes effect: the first
+    // instant at the new offset.
     at: Int
     // What was in force immediately before.
     before: TzOffset
@@ -76,161 +54,325 @@ pub struct TzTransition
 
 // A time zone: a name, a transition table, and optionally a POSIX
 // footer rule for instants past the table's end.
+//
+// The table is held in the last three fields.  They are read through
+// the functions below, which is the surface this package keeps stable.
 pub struct TzZone
-    // The IANA name this zone was looked up by — `"Europe/Berlin"`.
-    // A zone reached through a link carries the CANONICAL name, not
-    // the link: `tzdata.zone(db, "US/Eastern")` answers a zone named
-    // `"America/New_York"`, because the link is a spelling and the
-    // zone is a place. `tzdata.canonical_name` is how a caller asks
-    // the other question.
+    // The canonical IANA name, `"Europe/Berlin"`.  A zone reached through
+    // a link carries the canonical name, not the link.
     name: Str
-    // How many transitions the table holds. The table itself is not a
-    // public field: it is a packed integer array, and exposing it
-    // would fix a representation this package intends to keep free to
-    // change. `transition_at` and `transitions_between` are the reads.
+    // How many transitions the table holds.
     transition_count: Int
-    // The rule that extends this zone past its last transition, or
-    // `?` where the zone has none — which is every zone with no
-    // daylight saving and no future changes planned.
+    // The rule for instants past the table's end, or `None` where the
+    // zone has none.
     rule: ?tzposix.TzPosixRule
+    // The transition instants, UTC seconds, ascending.
+    times: [Int]
+    // For each transition, the index into `types` of what takes effect.
+    kinds: [Int]
+    // The offsets the table uses.  The first is in force before the
+    // first transition, as RFC 8536 section 3.2 says.
+    types: [TzOffset]
+
+// A zone from a TZif-shaped table: the transitions, the type each one
+// starts, and for each type its total offset, daylight flag and
+// abbreviation.  The saving and the standard part are worked out here.
+fn build(name: Str, times: [Int], kinds: [Int], utoffs: [Int], dsts: [Bool], abbrevs: [Str],
+         rule: ?tzposix.TzPosixRule) -> TzZone
+    var types: [TzOffset] = []
+    for k in 0..list.len(utoffs)
+        let save = if dsts[k]
+            save_of(k, kinds, utoffs, dsts, rule)
+        else
+            0
+        list.push(types, TzOffset {
+            total_seconds: utoffs[k],
+            standard_seconds: utoffs[k] - save,
+            save_seconds: save,
+            abbrev: abbrevs[k],
+            is_dst: dsts[k] })
+    TzZone {
+        name: name,
+        transition_count: list.len(times),
+        rule: rule,
+        times: times,
+        kinds: kinds,
+        types: types }
+
+// The saving of daylight type `k`: its offset less the offset of the
+// standard type just before or just after its first use in the table,
+// or the footer rule's saving, or an hour.
+fn save_of(k: Int, kinds: [Int], utoffs: [Int], dsts: [Bool], rule: ?tzposix.TzPosixRule) -> Int
+    for i in 0..list.len(kinds)
+        if kinds[i] == k
+            let prev = if i == 0
+                0
+            else
+                kinds[i - 1]
+            if not dsts[prev]
+                return utoffs[k] - utoffs[prev]
+            if i + 1 < list.len(kinds) and not dsts[kinds[i + 1]]
+                return utoffs[k] - utoffs[kinds[i + 1]]
+    match rule
+        Some(r) => r.dst_offset_seconds - r.std_offset_seconds
+        None    => 3600
+
+// The offset a rule gives at a UTC second.
+fn rule_offset(r: tzposix.TzPosixRule, utc_second: Int) -> TzOffset
+    let dst = tzposix.is_dst_at(r, utc_second)
+    let save = if dst
+        r.dst_offset_seconds - r.std_offset_seconds
+    else
+        0
+    TzOffset {
+        total_seconds: tzrule.offset_for(r.std_offset_seconds, r.dst_offset_seconds, dst),
+        standard_seconds: r.std_offset_seconds,
+        save_seconds: save,
+        abbrev: tzposix.abbrev_at(r, utc_second),
+        is_dst: dst }
+
+// The index of the last transition at or before `utc_second`, or -1
+// when the instant precedes them all.  A binary search.
+fn index_at(z: TzZone, utc_second: Int) -> Int
+    var lo = 0
+    var hi = list.len(z.times)
+    while lo != hi
+        let mid = (lo + hi) / 2
+        if z.times[mid] <= utc_second
+            lo = mid + 1
+        else
+            hi = mid
+    lo - 1
+
+// The instant of the table's last transition, or the smallest `Int`
+// for an empty table.
+fn last_time(z: TzZone) -> Int
+    if list.len(z.times) == 0
+        -9223372036854775807 - 1
+    else
+        z.times[-1]
+
+// The type in force after table index `i`, where -1 is before the
+// first transition.
+fn type_after(z: TzZone, i: Int) -> TzOffset
+    if i < 0
+        z.types[0]
+    else
+        z.types[z.kinds[i]]
 
 // The zone's canonical IANA name.
 pub fn zone_name(z: TzZone) -> Str []
-    todo("tz-nv.tzzone.zone_name")
+    z.name
 
 // The offset in force at a UTC instant.
 //
-// Cannot fail. Past the table's end the footer rule answers; past the
-// table's end with no footer rule, the last transition's offset
-// answers and `table_covers` is how a caller finds out that is what
-// happened.
+// Past the table's last transition the footer rule answers, and with no
+// footer rule the last transition's offset does.  `table_covers` says
+// which answered.
 //
 // ```novo
 // use tzdata
 // use tzzone
 //
 // fn main() [io]
-//     let db = tzdata.data_compact()
-//     match tzdata.zone(db, "Europe/Berlin")
-//         Ok(z)  => println(tzzone.offset_at(z, 1750000000).abbrev)
-//         Err(_) => println("no such zone")
+//     let z = tzdata.zone(tzdata.data_compact(), "Europe/Berlin")!
+//     println(tzzone.offset_at(z, 1750000000).abbrev)   // CEST
 // ```
 pub fn offset_at(z: TzZone, utc_second: Int) -> TzOffset []
-    todo("tz-nv.tzzone.offset_at")
+    if utc_second > last_time(z)
+        match z.rule
+            Some(r) =>
+                return rule_offset(r, utc_second)
+            None    =>
+                return type_after(z, list.len(z.times) - 1)
+    type_after(z, index_at(z, utc_second))
 
 // The offset in seconds east of UTC at a UTC instant.
-//
-// `offset_at(z, s).total_seconds`, published on its own because it is
-// the only field most callers want and building the `Str` for
-// `abbrev` to throw it away is the common case.
 pub fn offset_seconds_at(z: TzZone, utc_second: Int) -> Int []
-    todo("tz-nv.tzzone.offset_seconds_at")
+    offset_at(z, utc_second).total_seconds
 
 // The abbreviation in force at a UTC instant.
 pub fn abbrev_at(z: TzZone, utc_second: Int) -> Str []
-    todo("tz-nv.tzzone.abbrev_at")
+    offset_at(z, utc_second).abbrev
 
 // Whether daylight saving is in force at a UTC instant.
 pub fn is_dst_at(z: TzZone, utc_second: Int) -> Bool []
-    todo("tz-nv.tzzone.is_dst_at")
+    offset_at(z, utc_second).is_dst
 
-// The first transition strictly after a UTC instant, or `?` where the
-// zone has no more changes — a fixed zone, or a table with no footer
-// rule that has run out.
+// A change the footer rule makes at `at`.
+fn rule_transition(r: tzposix.TzPosixRule, at: Int) -> TzTransition
+    TzTransition { at: at, before: rule_offset(r, at - 1), after: rule_offset(r, at) }
+
+// The first transition strictly after a UTC instant, or `None` where
+// the zone makes no further change.
 //
-// This is what a scheduler asks: "when does the offset I just computed
-// stop being right". novoagent's timer and cron-nv's next-fire both
-// need it, because a job computed for a local wall time has to be
-// recomputed if the offset moves under it.
+// What a scheduler asks: when the offset just computed stops being
+// right.  Past the table's end the footer rule supplies it.
 pub fn transition_after(z: TzZone, utc_second: Int) -> ?TzTransition []
-    todo("tz-nv.tzzone.transition_after")
+    let i = index_at(z, utc_second) + 1
+    if i < list.len(z.times)
+        return transition_at(z, i)
+    match z.rule
+        Some(r) => footer_after(r, utc_second)
+        None    => None
 
-// The last transition at or before a UTC instant, or `?` where the
+// The footer rule's first change after `utc_second`, as a transition.
+fn footer_after(r: tzposix.TzPosixRule, utc_second: Int) -> ?TzTransition
+    match tzposix.next_change_after(r, utc_second)
+        Some(c) => Some(rule_transition(r, c))
+        None    => None
+
+// The last transition at or before a UTC instant, or `None` where the
 // instant precedes every transition the zone records.
 pub fn transition_before(z: TzZone, utc_second: Int) -> ?TzTransition []
-    todo("tz-nv.tzzone.transition_before")
+    if utc_second > last_time(z)
+        if let Some(r) = z.rule
+            if let Some(c) = tzposix.last_change_before(r, utc_second)
+                if c > last_time(z)
+                    return Some(rule_transition(r, c))
+    transition_at(z, index_at(z, utc_second))
 
-// Every transition in the half-open UTC range `[from_second, to_second)`.
+// Every transition in the half-open UTC range `[from_second,
+// to_second)`, ascending.
 //
-// Bounded by the range and not by the table, so a footer rule
-// contributes its changes here too: asking a European zone for the
-// year 2400 answers two transitions that are in no file.
+// The footer rule contributes its changes past the table's end, so a
+// European zone asked about the year 2400 answers two transitions that
+// are in no file.
 pub fn transitions_between(z: TzZone, from_second: Int, to_second: Int) -> [TzTransition] []
-    todo("tz-nv.tzzone.transitions_between")
+    var out: [TzTransition] = []
+    let first = index_at(z, from_second - 1) + 1
+    for k in first..list.len(z.times)
+        if z.times[k] >= to_second
+            break
+        list.push(out, table_transition(z, k))
+    if let Some(r) = z.rule
+        var cursor = larger(from_second - 1, last_time(z))
+        var more = true
+        while more
+            let c = tzposix.next_change_after(r, cursor) ?? to_second
+            more = c < to_second
+            if more
+                list.push(out, rule_transition(r, c))
+                cursor = c
+    out
+
+// The larger of two integers.
+fn larger(a: Int, b: Int) -> Int
+    if a > b
+        a
+    else
+        b
 
 // The `i`th transition in the zone's own table, counting from zero, or
-// `?` where `i` is out of range.
+// `None` where `i` is out of range.
 //
-// The table only — the footer rule contributes nothing here, because
-// the footer has no index.
+// The table only: the footer rule's changes have no index.
 pub fn transition_at(z: TzZone, i: Int) -> ?TzTransition []
-    todo("tz-nv.tzzone.transition_at")
+    if i < 0 or i >= list.len(z.times)
+        return None
+    Some(table_transition(z, i))
+
+// The table's transition `i`, for an `i` in range.
+fn table_transition(z: TzZone, i: Int) -> TzTransition
+    TzTransition { at: z.times[i], before: type_after(z, i - 1), after: type_after(z, i) }
 
 // How many transitions the zone's table holds.
 pub fn transition_count(z: TzZone) -> Int []
-    todo("tz-nv.tzzone.transition_count")
+    list.len(z.times)
 
-// Whether the zone's own table covers this instant, as opposed to the
-// answer being extrapolated from the footer rule or held flat from the
-// last entry.
+// Whether the zone's own table covers this instant: it lies between the
+// first and the last transition, inclusive.
 //
-// The honest form of "we know this" versus "we computed this", and the
-// reason it is public: an application stamping a legal record wants to
-// know which it got.
+// Outside that range the answer is extrapolated, from the footer rule or
+// from the first or last entry.  An application stamping a legal record
+// may want to know which it got.
 pub fn table_covers(z: TzZone, utc_second: Int) -> Bool []
-    todo("tz-nv.tzzone.table_covers")
+    list.len(z.times) > 0 and z.times[0] <= utc_second and utc_second <= z.times[-1]
 
-// The first and last UTC seconds the zone's table covers, as a pair.
+// The first and last UTC seconds of the zone's table, as a pair.
 //
-// A zone with no transitions answers `(0, 0)`, which `transition_count`
-// of zero is how a caller tells apart from a zone that happens to
-// cover the epoch alone.
+// A zone with no transitions answers `(0, 0)`, and `transition_count`
+// of zero tells it apart from a table that covers the epoch alone.
 pub fn table_range(z: TzZone) -> (Int, Int) []
-    todo("tz-nv.tzzone.table_range")
+    if list.len(z.times) == 0
+        (0, 0)
+    else
+        (z.times[0], z.times[-1])
 
-// The zone's POSIX footer rule, or `?` where it has none.
+// The zone's POSIX footer rule, or `None` where it has none.
 pub fn posix_rule(z: TzZone) -> ?tzposix.TzPosixRule []
-    todo("tz-nv.tzzone.posix_rule")
+    z.rule
 
-// Every distinct offset the zone has ever been at, oldest first.
+// Whether two offsets are the same in every field.
+fn same_offset(a: TzOffset, b: TzOffset) -> Bool
+    a.total_seconds == b.total_seconds and a.save_seconds == b.save_seconds and a.abbrev == b.abbrev and a.is_dst == b.is_dst
+
+// Add `o` to `seen` when no offset in it is the same.
+fn add_distinct(var seen: [TzOffset], o: TzOffset)
+    for s in seen
+        if same_offset(s, o)
+            return
+    list.push(seen, o)
+
+// Every distinct offset the zone has been at, in the order the table
+// first uses them, then the footer rule's.
 //
-// What a picker populates a menu from, and what a validator checks a
-// stored offset against.
+// What a picker fills a menu from, and what a validator checks a stored
+// offset against.
 pub fn offsets_of(z: TzZone) -> [TzOffset] []
-    todo("tz-nv.tzzone.offsets_of")
+    var seen: [TzOffset] = [z.types[0]]
+    for k in z.kinds
+        add_distinct(seen, z.types[k])
+    if let Some(r) = z.rule
+        add_distinct(seen, rule_offset(r, 0))
+        if r.has_dst
+            let change = tzposix.next_change_after(r, 0) ?? 0
+            add_distinct(seen, rule_offset(r, change))
+            add_distinct(seen, rule_offset(r, change - 1))
+    seen
 
 // A zone with one offset and no transitions.
 //
-// `from_posix(tzposix.fixed("UTC", 0), "UTC")` is the same value; this
-// is the spelling for the case a caller has an offset and a label and
-// no rule at all, which is what a stored `+05:30` in a database row
-// is.
+// The spelling for an offset and a label with no rule at all, which is
+// what a stored `+05:30` in a database row is.
+//
+// ```novo
+// use tzzone
+//
+// fn main() [io]
+//     let z = tzzone.fixed("Asia/Kolkata", 19800, "IST")
+//     println("${tzzone.offset_seconds_at(z, 0)}")   // 19800
+// ```
 pub fn fixed(name: Str, offset_seconds: Int, abbrev: Str) -> TzZone []
-    todo("tz-nv.tzzone.fixed")
+    build(name, [], [], [offset_seconds], [false], [abbrev], None)
 
 // UTC itself, as a zone.
 pub fn utc() -> TzZone []
-    todo("tz-nv.tzzone.utc")
+    fixed("UTC", 0, "UTC")
 
 // A zone whose whole content is a POSIX rule and no table.
 //
 // What `TZ=EST5EDT,M3.2.0,M11.1.0` means, and what a device provisions
-// itself with. It is a real zone to every function in this module; it
-// simply has nothing to say about 1974, when the United States moved
-// its rules by act of Congress.
+// itself with.  It answers every function in this module, and it knows
+// nothing of any year in which the rule was different.
 pub fn from_posix(rule: tzposix.TzPosixRule, name: Str) -> TzZone []
-    todo("tz-nv.tzzone.from_posix")
+    build(name, [], [], [rule.std_offset_seconds], [false], [rule.std_abbrev], Some(rule))
 
-// Whether the zone ever changes offset.
+// Whether the zone never changes offset: no transitions in its table,
+// and no footer rule or a fixed one.
 pub fn is_fixed(z: TzZone) -> Bool []
-    todo("tz-nv.tzzone.is_fixed")
+    if list.len(z.times) > 0
+        return false
+    match z.rule
+        Some(r) => tzposix.is_fixed(r)
+        None    => true
 
-// The instant the zone stops being able to answer from its own
-// records, as a `Result` a caller can refuse on.
+// The last instant the zone's table records.
 //
-// `Ok(second)` is the last instant the table covers; `Err` names the
-// zone when the zone has no table at all. Most callers want
-// `table_covers`; this is for the one that wants to report the horizon
-// rather than test a point.
+// `Err` names the zone when it has no table at all.  Most callers want
+// `table_covers`; this is for one that reports the horizon rather than
+// testing a point.
 pub fn table_horizon(z: TzZone) -> Result<Int, tzerr.TzError> []
-    todo("tz-nv.tzzone.table_horizon")
+    if list.len(z.times) == 0
+        return Err(TzZoneOutOfRange(z.name, 0))
+    Ok(z.times[-1])

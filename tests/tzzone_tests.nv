@@ -1,0 +1,95 @@
+// tests/tzzone_tests.nv — a zone's table and its footer, at their
+// edges: inside the table, past its end, and with no table at all.
+//
+// Kolkata's compact table is empty and its footer is fixed.  The full
+// table of Kolkata ends in 1945 with the footer `IST-5:30`.  New York's
+// full table ends in 2007, and its footer gives every change after.
+
+use std.test
+use std.list
+use tzdata
+use tzposix
+use tzzone
+
+@test
+fn test_inside_the_table_the_table_answers()
+    let db = tzdata.data_full()
+    let z = tzdata.zone(db, "America/New_York")!
+    // 1990-01-01T00:00:00Z, inside the table.
+    let t = 631152000
+    test.assert_eq(tzzone.table_covers(z, t), true)
+    match tzzone.transition_after(z, t)
+        Some(tr) =>
+            // 1990-04-01T07:00:00Z, the first Sunday in April at 02:00 EST.
+            test.assert_eq(tr.at, 638953200)
+            test.assert_eq(tr.after.abbrev, "EDT")
+        None     => test.assert(false)
+    match tzzone.transition_before(z, t)
+        Some(tr) => test.assert_eq(tr.after.abbrev, "EST")
+        None     => test.assert(false)
+    test.assert_eq(tzzone.transition_at(z, -1) == None, true)
+    test.assert_eq(tzzone.transition_at(z, tzzone.transition_count(z)) == None, true)
+    // 1883-11-18, when railway time replaced local mean time.
+    match tzzone.transition_before(z, -2717650801)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    test.assert_eq(tzzone.offset_seconds_at(z, -2717650801), -17762)
+
+@test
+fn test_a_table_across_its_end_hands_over_to_the_footer()
+    let db = tzdata.data_full()
+    let z = tzdata.zone(db, "America/New_York")!
+    let (first, last) = tzzone.table_range(z)
+    test.assert(first < last)
+    // 2006-01-01 to 2009-01-01: the table's changes and the footer's.
+    let all = tzzone.transitions_between(z, 1136073600, 1230768000)
+    test.assert_eq(list.len(all), 6)
+    for tr in all
+        test.assert(tr.before.total_seconds != tr.after.total_seconds)
+    match tzzone.table_horizon(z)
+        Ok(h)  => test.assert_eq(h, last)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_fixed_footer_past_the_table_gives_no_more_changes()
+    let db = tzdata.data_full()
+    let z = tzdata.zone(db, "Asia/Kolkata")!
+    test.assert_eq(tzzone.transition_after(z, 0) == None, true)
+    test.assert_eq(tzzone.is_fixed(z), false)
+    test.assert_eq(tzzone.offset_seconds_at(z, 0), 19800)
+    let compact = tzdata.zone(tzdata.data_compact(), "Asia/Kolkata")!
+    test.assert_eq(tzzone.transition_count(compact), 0)
+    test.assert_eq(tzzone.is_fixed(compact), true)
+    test.assert_eq(tzzone.table_range(compact).0, 0)
+
+@test
+fn test_a_zone_with_no_rule_holds_its_last_offset()
+    let z = tzzone.fixed("Test/Fixed", 3600, "CET")
+    test.assert_eq(tzzone.transition_after(z, 0) == None, true)
+    test.assert_eq(tzzone.transition_before(z, 0) == None, true)
+    test.assert_eq(list.len(tzzone.transitions_between(z, 0, 100000000)), 0)
+    test.assert_eq(list.len(tzzone.offsets_of(z)), 1)
+    match tzzone.table_horizon(z)
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                TzZoneOutOfRange(zone, _) => test.assert_eq(zone, "Test/Fixed")
+                _                         => test.assert(false)
+
+@test
+fn test_a_zone_of_a_rule_alone_answers_every_question()
+    let r = tzposix.parse("EST5EDT,M3.2.0,M11.1.0")!
+    let z = tzzone.from_posix(r, "Test/Rule")
+    // 2026-03-08T07:00:00Z is the second Sunday in March at 02:00 EST.
+    match tzzone.transition_after(z, 1767225600)
+        Some(tr) =>
+            test.assert_eq(tr.at, 1772953200)
+            test.assert_eq(tr.before.abbrev, "EST")
+            test.assert_eq(tr.after.save_seconds, 3600)
+        None     => test.assert(false)
+    match tzzone.transition_before(z, 1784116800)
+        Some(tr) => test.assert_eq(tr.at, 1772953200)
+        None     => test.assert(false)
+    test.assert_eq(list.len(tzzone.transitions_between(z, 1767225600, 1798761600)), 2)
+    test.assert_eq(list.len(tzzone.offsets_of(z)), 2)
+    test.assert_eq(tzzone.is_fixed(tzzone.from_posix(tzposix.fixed("UTC", 0), "UTC")), true)

@@ -1,209 +1,388 @@
-// tzdata.nv — the IANA database as bytes this package owns, and the
-// lookup over them.
+// tzdata — the IANA database as bytes this package owns, and the lookup
+// over them.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// THE DATABASE IS DATA, NOT A DIRECTORY. `data_full()` returns a value
-// with no file behind it: the transition tables are compiled into a
-// byte array at build time and the accessor is a binary search over
-// it. That is what makes the whole package `core` and what makes it
-// work identically on a host with no `/usr/share/zoneinfo`, in a wasm
+// The database is data, not a directory.  `data_full()` answers a value
+// with no file behind it: the tables are compiled into this package as
+// a pack, and a lookup is a search over it.  The package therefore
+// works the same on a host with no `/usr/share/zoneinfo`, in a wasm
 // build, and in a test that must give the same answer in ten years.
 //
-// THE PACK, AND WHY IT HAS A VERSION IN IT. `TZ_PACK_MAGIC` and
-// `TZ_PACK_FORMAT` are the two facts a reader checks before it trusts
-// a byte. The tzdata release — `"2025b"` — is a THIRD fact and a
-// different one: it says which political decisions the tables reflect,
-// and it is the number an operator needs when a government moves a
-// zone and the answers stop matching. unicode-nv's `udata` arranges
-// its tables the same way, for the same reason, and a reader who
-// knows one knows this one.
+// A pack is checked by its first bytes, `TZ_PACK_MAGIC`, and its layout
+// version, `TZ_PACK_FORMAT`.  The tzdata release, `TZ_DATA_RELEASE`, is
+// a third and different fact: which political decisions the tables
+// record.  It is the number an operator needs when a government moves a
+// zone and the answers stop matching.
 //
-// WHAT THE PACKS COST, STATED AS NUMBERS because a `core` package that
-// embeds a table has to say how big the table is before somebody
-// discovers it in a firmware image:
+// The two bundled packs, from tzdata 2026c:
 //
-//   `data_compact()`   about 96 KB — 340 canonical zones and 250
-//                      links, transitions from 1970 to 2038 only, with
-//                      every earlier one dropped and the POSIX footer
-//                      kept. This is the pack a server wants: every
-//                      timestamp it will ever see is in range.
-//   `data_full()`      about 310 KB — the same zones with the whole
-//                      recorded history back to each zone's first
-//                      transition, which is the 1880s for most of
-//                      Europe and 1901 for the earliest entries.
-//                      Needed for archival conversion and for nothing
-//                      else.
+//   `data_compact()`  127 057 bytes: 447 zones and 151 links, the
+//                     transitions from 1970 to 2038 with 32-bit times,
+//                     and every footer rule.
+//   `data_full()`     233 354 bytes: the same zones with the whole
+//                     recorded history and 64-bit times.
 //
-// Both numbers are the design's budget rather than a measurement, and
-// the implementation step reports what they came out at. For scale:
-// chrono-tz compiles to roughly 250 KB, Go's embedded `zoneinfo.zip`
-// to about 450 KB, and Python's `tzdata` wheel ships about 500 KB of
-// raw TZif — so a compact pack under 100 KB is the claim being made
-// here, and it is made by dropping history rather than by compressing
-// harder.
+// Neither is built for a microcontroller.  The device answer is
+// `tzrule`: one zone, forty bytes of rule, and integer arithmetic.
 //
-// NEITHER PACK IS A DEVICE CLAIM. 96 KB does not fit a Cortex-M0 with
-// 32 KB of flash to spare, and pretending otherwise would be the kind
-// of claim that fails in somebody's build rather than in ours. The
-// device answer is `tzposix`: one zone, forty bytes, and integer
-// arithmetic. The README says so where a reader will look.
+// The pack layout is written out in `tools/build_pack.py`, which makes
+// both packs from the system's tzdata.  Each zone is stored as a TZif
+// data block with its footer, and `tzif` reads it.
 
+use std.bytes
+use std.str
+use std.list
 use tzerr
+use tzif
 use tzzone
 
 // The tzdata release the bundled packs were compiled from.
 //
-// Bumping this is a release of this package, and the changelog entry
-// says which zones moved — because a program that scheduled a meeting
-// under the old rules and reads it back under the new ones gets a
-// different wall time, and that is a thing an operator must be able to
-// find out about.
-pub const TZ_DATA_RELEASE = "2025b"
+// Moving it is a release of this package, and the changelog says which
+// zones changed.  A meeting scheduled under the old rules and read back
+// under the new ones has a different wall time, and an operator must be
+// able to find that out.
+pub const TZ_DATA_RELEASE = "2026c"
 
-// The first bytes of a pack, so a reader knows what it is holding
-// before it reads a field.
+// The first bytes of a pack.
 pub const TZ_PACK_MAGIC = "NVTZ1"
 
-// The pack layout's own version, which moves when the layout changes
-// and not when the tzdata release does. The two are separate numbers
-// because they move for separate reasons.
+// The pack layout's own version.  It moves when the layout changes and
+// not when the tzdata release does.
 pub const TZ_PACK_FORMAT = 1
 
-// A compiled zone database: the pack bytes plus the index that makes a
-// name lookup a search rather than a scan.
+// A compiled zone database: the pack bytes and the index read out of
+// them.
+//
+// The fields after `has_history` are the index.  They are read through
+// the functions below.
 pub struct TzDb
-    // The tzdata release these tables were compiled from, `"2025b"`.
+    // The tzdata release these tables were compiled from, `"2026c"`.
     release: Str
     // How many canonical zones the pack holds.
     zone_count: Int
-    // How many links — alternative names — it holds. `"US/Eastern"`
-    // is a link to `"America/New_York"`, and the database has about
-    // as many links as zones because every name that has ever been
-    // published stays resolvable forever.
+    // How many links, alternative names, it holds.  `"US/Eastern"` is a
+    // link to `"America/New_York"`.
     link_count: Int
-    // Whether the pack carries pre-1970 history.
+    // Whether the pack carries the transitions before 1970.
     has_history: Bool
+    // The pack itself.
+    pack: Bytes
+    // The canonical names, sorted.
+    names: [Str]
+    // For each zone, the offset of its TZif block in `pack`.
+    blocks: [Int]
+    // For each zone, its ISO 3166 codes as `zone1970.tab` gives them,
+    // `"CH,DE,LI"`, or `""`.
+    countries: [Str]
+    // For each zone, whether `zone1970.tab` gives coordinates.
+    located: [Bool]
+    // For each zone, its latitude in seconds of arc.
+    latitudes: [Int]
+    // For each zone, its longitude in seconds of arc.
+    longitudes: [Int]
+    // The link names, sorted.
+    links: [Str]
+    // For each link, the index in `names` of the zone it names.
+    targets: [Int]
 
-// The whole database, history included. About 310 KB.
+// A reader over a pack: the bytes, the offset reached, and the offset
+// of the first read that ran past the end, or -1.
+struct Cursor
+    b: Bytes
+    at: Int
+    fault: Int
+
+// The cursor moved `n` bytes on, with the fault set if that passes the
+// end.
+fn advance(c: Cursor, n: Int) -> Cursor
+    if c.at + n > bytes.len(c.b) and c.fault < 0
+        return Cursor { b: c.b, at: c.at + n, fault: c.at }
+    Cursor { b: c.b, at: c.at + n, fault: c.fault }
+
+// The unsigned big-endian integer of `width` bytes at the cursor, and
+// the cursor past it.  Past the end the bytes read as zero.
+fn take_uint(c: Cursor, width: Int) -> (Int, Cursor)
+    var n = 0
+    for k in 0..width
+        n = n * 256 + (bytes.byte_at(c.b, c.at + k) ?? 0)
+    (n, advance(c, width))
+
+// A signed big-endian 32-bit integer at the cursor.
+fn take_i32(c: Cursor) -> (Int, Cursor)
+    let (v, next) = take_uint(c, 4)
+    if v >= 2147483648
+        (v - 4294967296, next)
+    else
+        (v, next)
+
+// A string of `u8` length at the cursor.
+fn take_text(c: Cursor) -> (Str, Cursor)
+    let (n, after) = take_uint(c, 1)
+    let stop = if after.at + n > bytes.len(c.b)
+        bytes.len(c.b)
+    else
+        after.at + n
+    let text = if stop > after.at
+        bytes.to_str(bytes.slice(c.b, after.at, stop))
+    else
+        ""
+    (text, advance(after, n))
+
+// The database in a pack whose magic and layout have been checked, and
+// the offset of the first read that ran past the end or named a zone
+// that is not there, or -1.
+fn read_pack(blob: Bytes) -> (TzDb, Int)
+    let (release, c1) = take_text(Cursor { b: blob, at: 6, fault: -1 })
+    let (history, c2) = take_uint(c1, 1)
+    let (zone_count, c3) = take_uint(c2, 2)
+    var c = c3
+    var names: [Str] = []
+    var blocks: [Int] = []
+    var countries: [Str] = []
+    var located: [Bool] = []
+    var lats: [Int] = []
+    var lons: [Int] = []
+    for _i in 0..zone_count
+        let (name, a) = take_text(c)
+        let (codes, b2) = take_text(a)
+        let (has, d) = take_uint(b2, 1)
+        let (lat, e) = take_i32(d)
+        let (lon, f) = take_i32(e)
+        let (len, g) = take_uint(f, 4)
+        list.push(names, name)
+        list.push(countries, codes)
+        list.push(located, has == 1)
+        list.push(lats, lat)
+        list.push(lons, lon)
+        list.push(blocks, g.at)
+        c = advance(g, len)
+    let (link_count, l0) = take_uint(c, 2)
+    c = l0
+    var links: [Str] = []
+    var targets: [Int] = []
+    for _i in 0..link_count
+        let (name, a) = take_text(c)
+        let (target, b2) = take_uint(a, 2)
+        c = b2
+        if target >= zone_count and c.fault < 0
+            c = Cursor { b: blob, at: c.at, fault: a.at }
+        list.push(links, name)
+        list.push(targets, target)
+    let db = TzDb {
+        release: release,
+        zone_count: zone_count,
+        link_count: link_count,
+        has_history: history == 1,
+        pack: blob,
+        names: names,
+        blocks: blocks,
+        countries: countries,
+        located: located,
+        latitudes: lats,
+        longitudes: lons,
+        links: links,
+        targets: targets }
+    (db, c.fault)
+
+// A database read out of a pack the caller supplies.
+//
+// A program pins a tzdata release with this: it builds a pack once with
+// `tools/build_pack.py`, stores it, and loads it here.  It is also how
+// a newer database reaches an older build of this package.  The index
+// is checked here, and each zone's block when the zone is looked up.
+//
+// ```novo
+// use std.bytes
+// use tzdata
+//
+// fn main() [io]
+//     match tzdata.data_from_pack(bytes.from_str("not a pack"))
+//         Ok(_)  => println("read")
+//         Err(e) => println(e.message())   // unreadable pack at offset 0
+// ```
+pub fn data_from_pack(blob: Bytes) -> Result<TzDb, tzerr.TzError> []
+    if bytes.len(blob) < 6 or bytes.to_str(bytes.slice(blob, 0, 5)) != TZ_PACK_MAGIC
+        return Err(TzPackUnreadable(0))
+    let layout = bytes.byte_at(blob, 5) ?? 0
+    if layout != TZ_PACK_FORMAT
+        return Err(TzPackVersion("${layout}", "${TZ_PACK_FORMAT}"))
+    let (db, fault) = read_pack(blob)
+    if fault >= 0
+        return Err(TzPackUnreadable(fault))
+    Ok(db)
+
+// A bundled pack, from its base64 text.  The packs are generated and
+// checked by `tools/build_pack.py`, so they are read without the checks
+// `data_from_pack` makes.
+fn bundled(text: Str) -> TzDb
+    let (db, _fault) = read_pack(bytes.from_base64(text) ?? bytes.zeros(0))
+    db
+
+// The whole database, history included: 233 354 bytes.
+//
+// Each call decodes the pack, so a program calls it once and keeps the
+// answer.
 //
 // ```novo
 // use tzdata
 //
 // fn main() [io]
-//     let db = tzdata.data_full()
-//     println(tzdata.data_version(db))
+//     println(tzdata.data_version(tzdata.data_full()))   // 2026c
 // ```
 pub fn data_full() -> TzDb []
-    todo("tz-nv.tzdata.data_full")
+    bundled(full_pack_text())
 
-// The database from 1970 onward, with earlier transitions dropped.
-// About 96 KB, and the one to use unless timestamps from before the
-// epoch are actually converted.
+// The database from 1970 to 2038: 127 057 bytes.  The one to use
+// unless timestamps from before 1970 are converted.
+//
+// Each call decodes the pack, so a program calls it once and keeps the
+// answer.
 pub fn data_compact() -> TzDb []
-    todo("tz-nv.tzdata.data_compact")
+    bundled(compact_pack_text())
 
-// A database read out of a pack the caller supplies.
-//
-// This is the seam that lets a program ship its own tables: a service
-// that must pin tzdata 2024a for a year builds a pack once, stores it,
-// and loads it here, and the reading is still `[]` because the bytes
-// arrived as an argument. It is also how a newer database reaches an
-// older build of this package without a release.
-pub fn data_from_pack(blob: [u8]) -> Result<TzDb, tzerr.TzError> []
-    todo("tz-nv.tzdata.data_from_pack")
+// The database as a pack, which `data_from_pack` reads back.
+pub fn pack_bytes(db: TzDb) -> Bytes []
+    bytes.clone(db.pack)
 
-// Write a database back out as a pack, into a buffer the caller owns.
-//
-// Answers the written prefix. The caller sizes the buffer with
-// `pack_len`; a buffer that is too short is a short write and not a
-// panic, because a `core` package that aborted on a caller's
-// arithmetic would be unusable in the firmware case it exists for.
-pub fn pack_bytes(out: [u8], db: TzDb) -> [u8] []
-    todo("tz-nv.tzdata.pack_bytes")
-
-// How many bytes `pack_bytes` will write.
+// How many bytes `pack_bytes` answers.
 pub fn pack_len(db: TzDb) -> Int []
-    todo("tz-nv.tzdata.pack_len")
+    bytes.len(db.pack)
 
 // The tzdata release this database was compiled from.
 pub fn data_version(db: TzDb) -> Str []
-    todo("tz-nv.tzdata.data_version")
+    db.release
 
 // Every canonical zone name, sorted.
 //
-// About 340 strings. A picker's list, and the thing a validator checks
-// a configuration value against.
+// 447 names in 2026c: a picker's list, and what a validator checks a
+// configuration value against.
 pub fn zone_names(db: TzDb) -> [Str] []
-    todo("tz-nv.tzdata.zone_names")
+    db.names[:]
 
-// Every link name — the alternative spellings — sorted.
+// Every link name, sorted.
 pub fn link_names(db: TzDb) -> [Str] []
-    todo("tz-nv.tzdata.link_names")
+    db.links[:]
+
+// The index of `name` in the sorted list `names`, or -1.  A binary
+// search.
+fn find(names: [Str], name: Str) -> Int
+    var lo = 0
+    var hi = list.len(names)
+    while lo != hi
+        let mid = (lo + hi) / 2
+        if names[mid] == name
+            return mid
+        if names[mid] < name
+            lo = mid + 1
+        else
+            hi = mid
+    -1
+
+// The index of the zone `name` names, canonical or link, or -1.
+fn zone_index(db: TzDb, name: Str) -> Int
+    let i = find(db.names, name)
+    if i >= 0
+        return i
+    let l = find(db.links, name)
+    if l >= 0
+        db.targets[l]
+    else
+        -1
 
 // Whether the database knows a name, canonical or link.
 pub fn has_zone(db: TzDb, name: Str) -> Bool []
-    todo("tz-nv.tzdata.has_zone")
+    zone_index(db, name) >= 0
 
-// The canonical name a name resolves to, or `?` where the database
+// The canonical name a name resolves to, or `None` where the database
 // knows no such name.
 //
-// `canonical_name(db, "US/Eastern")` is `"America/New_York"`, and
-// `canonical_name(db, "America/New_York")` is itself. This is the call
-// a program makes before STORING a zone name, because storing the link
-// stores a spelling that IANA may one day stop publishing.
-pub fn canonical_name(db: TzDb, name: Str) -> ?Str []
-    todo("tz-nv.tzdata.canonical_name")
-
-// Every name that resolves to a canonical zone, the canonical one
-// first.
+// `"US/Eastern"` resolves to `"America/New_York"`, and a canonical name
+// to itself.  A program calls this before storing a zone name, because
+// IANA may one day stop publishing a link.
 //
-// What a migration needs: given `"America/New_York"`, which strings in
-// the old configuration file meant it.
+// ```novo
+// use tzdata
+//
+// fn main() [io]
+//     println(tzdata.canonical_name(tzdata.data_compact(), "US/Eastern") ?? "none")   // America/New_York
+// ```
+pub fn canonical_name(db: TzDb, name: Str) -> ?Str []
+    let i = zone_index(db, name)
+    if i < 0
+        None
+    else
+        Some(db.names[i])
+
+// Every name that resolves to a canonical zone, the canonical one first
+// and the links after it, sorted.
+//
+// What a migration needs: which strings in an old configuration file
+// meant `"America/New_York"`.  Empty for a name that is not canonical.
 pub fn names_for(db: TzDb, canonical: Str) -> [Str] []
-    todo("tz-nv.tzdata.names_for")
+    let i = find(db.names, canonical)
+    if i < 0
+        return []
+    var out: [Str] = [canonical]
+    for l in 0..list.len(db.links)
+        if db.targets[l] == i
+            list.push(out, db.links[l])
+    out
 
 // Look a zone up by name.
 //
 // Accepts a canonical name or a link, and answers a zone carrying the
-// CANONICAL name either way. The lookup is case-sensitive, as IANA's
-// own names are: `"europe/berlin"` is `TzUnknownZone`, because a
-// library that folded case here would accept a name no other tzdata
-// implementation accepts and the configuration file would stop working
-// the day it moved.
+// canonical name either way.  The lookup is case-sensitive, as IANA's
+// names are: `"europe/berlin"` is `TzUnknownZone`.
 //
 // ```novo
 // use tzdata
 //
 // fn main() [io]
-//     let db = tzdata.data_compact()
-//     match tzdata.zone(db, "US/Eastern")
-//         Ok(z)  => println(z.name)
+//     match tzdata.zone(tzdata.data_compact(), "US/Eastern")
+//         Ok(z)  => println(z.name)   // America/New_York
 //         Err(_) => println("no such zone")
 // ```
 pub fn zone(db: TzDb, name: Str) -> Result<tzzone.TzZone, tzerr.TzError> []
-    todo("tz-nv.tzdata.zone")
+    let i = zone_index(db, name)
+    if i < 0
+        return Err(TzUnknownZone(name))
+    let size = if db.has_history
+        8
+    else
+        4
+    tzif.zone_at(db.pack, db.blocks[i], size, db.names[i])
 
-// The two-letter ISO 3166 country codes a zone is used in, sorted.
+// The ISO 3166 country codes a zone is used in, sorted, from
+// `zone1970.tab`.
 //
-// From `zone.tab`, which IANA ships beside the rules. A zone may have
-// more than one — `Europe/Zurich` covers Liechtenstein — and a few
-// have none, because `Etc/GMT+5` is not a place.
+// A zone may have more than one: `Europe/Zurich` covers Liechtenstein
+// and part of Germany.  A zone that is not a place, such as
+// `Etc/GMT+5`, has none.  A link answers its zone's codes.
 pub fn countries_of(db: TzDb, name: Str) -> [Str] []
-    todo("tz-nv.tzdata.countries_of")
+    let i = zone_index(db, name)
+    if i < 0 or db.countries[i] == ""
+        return []
+    str.split(db.countries[i], ",")
 
 // Every canonical zone used in a country, sorted.
 //
-// What a signup form's second dropdown is populated from.
+// What a sign-up form's second list is filled from.
 pub fn zones_in_country(db: TzDb, country_code: Str) -> [Str] []
-    todo("tz-nv.tzdata.zones_in_country")
+    var out: [Str] = []
+    for i in 0..list.len(db.names)
+        if list.contains(str.split(db.countries[i], ","), country_code)
+            list.push(out, db.names[i])
+    out
 
-// The zone's approximate coordinates from `zone.tab`, in decimal
-// degrees, or `?` where the database carries none.
+// The zone's coordinates from `zone1970.tab`, as latitude and longitude
+// in seconds of arc, north and east positive, or `None` where the
+// database gives none.
 //
-// Approximate is IANA's word: the point is the zone's principal city,
-// to the arc-minute, and it is in the database so a picker can put a
-// pin on a map. It is not a geocoder and a program that reverse-looked
-// a user's position through it would be wrong by a country.
+// The point is the zone's principal city, which IANA records so a
+// picker can put a pin on a map.  It is not a geocoder: the nearest
+// such point to a user can be in another country.
 pub fn coordinates_of(db: TzDb, name: Str) -> ?(Int, Int) []
-    todo("tz-nv.tzdata.coordinates_of")
+    let i = zone_index(db, name)
+    if i < 0 or not db.located[i]
+        return None
+    Some((db.latitudes[i], db.longitudes[i]))

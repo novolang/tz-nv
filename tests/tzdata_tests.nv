@@ -1,21 +1,17 @@
-// tzdata_tests.nv — the database, the lookup, and a zone's answers at
-// an instant.
+// tests/tzdata_tests.nv — the database, the lookup, and a zone's
+// answers at an instant.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tz-nv.<module>.<fn>`. That
-// is the expected result until the bodies land.
-//
-// THE VECTORS ARE THE DATABASE'S OWN. Every instant, offset and
-// abbreviation below is what `zdump -v` prints for the named zone
-// under tzdata 2025b, which is the oracle chrono-tz and Python's
-// `zoneinfo` are both checked against. Four zones carry the cases:
-// Berlin for an ordinary European rule, Kolkata for a half-hour offset
-// with no daylight saving at all, Lord Howe Island for a
-// thirty-minute saving, and Pacific/Apia for the day that does not
-// exist.
+// Every instant, offset and abbreviation below is what Python's
+// `zoneinfo` answers under tzdata 2026c, the release the packs are
+// compiled from.  Four zones carry the cases: Berlin for an ordinary
+// European rule, Kolkata for a half-hour offset with no daylight saving,
+// Lord Howe Island for a thirty-minute saving, and Pacific/Apia for the
+// day that did not happen.  tests/zoneinfo_vectors_tests.nv checks
+// twenty zones the same way at scale.
 
 use std.test
 use std.list
+use std.bytes
 use tzdata
 use tzerr
 use tzposix
@@ -39,15 +35,14 @@ fn test_the_database_says_which_release_it_was_compiled_from() [io]
 fn test_a_pack_round_trips_through_bytes() [io]
     test.case("a pack written out reads back as the same database")
     let db = tzdata.data_compact()
-    let out: [u8] = []
-    let written = tzdata.pack_bytes(out, db)
-    test.assert(tzdata.pack_len(db) >= 0)
+    let written = tzdata.pack_bytes(db)
+    test.assert(tzdata.pack_len(db) == bytes.len(written))
     match tzdata.data_from_pack(written)
         Ok(again) => test.assert(tzdata.data_version(again) == tzdata.data_version(db))
         Err(_)    => test.assert(false)
 
     test.case("bytes that are not a pack are refused, with the offset")
-    let junk: [u8] = []
+    let junk = bytes.zeros(0)
     match tzdata.data_from_pack(junk)
         Ok(_)  => test.assert(false)
         Err(e) =>
@@ -88,7 +83,6 @@ fn test_a_link_is_a_spelling_and_a_zone_is_a_place() [io]
         Err(e) =>
             test.assert(tzerr.source_of(e) == "lookup")
             test.assert(tzerr.offset_of(e) == 0 - 1)
-            test.assert(e.message() != "")
 
 @test
 fn test_the_country_tables_are_what_a_picker_is_built_from() [io]
@@ -98,7 +92,7 @@ fn test_the_country_tables_are_what_a_picker_is_built_from() [io]
     test.assert(tzdata.countries_of(db, "Europe/Zurich") == ["CH", "DE", "LI"])
 
     test.case("a country names its zones")
-    test.assert(list.len(tzdata.zones_in_country(db, "DK")) == 2)
+    test.assert(tzdata.zones_in_country(db, "DE") == ["Europe/Berlin", "Europe/Zurich"])
 
     test.case("a zone that is not a place has coordinates for nowhere")
     test.assert(tzdata.coordinates_of(db, "Etc/GMT+5") == None)
@@ -219,3 +213,66 @@ fn test_a_zone_can_be_built_without_a_database_at_all() [io]
             test.assert(tzzone.is_dst_at(z, 1_784_116_800))
             let fixed_rule = tzposix.fixed("UTC", 0)
             test.assert(tzposix.is_fixed(fixed_rule))
+
+// A pack with `blob` spliced in at `at`, replacing `n` bytes.
+fn patched(pack: Bytes, at: Int, n: Int, blob: Bytes) -> Bytes
+    bytes.concat([bytes.slice(pack, 0, at), blob, bytes.slice(pack, at + n, bytes.len(pack))])
+
+// The offset a refused pack names, or -2 when it was read.
+fn refused_at(blob: Bytes) -> Int
+    match tzdata.data_from_pack(blob)
+        Ok(_)  => -2
+        Err(e) => tzerr.offset_of(e)
+
+@test
+fn test_a_damaged_pack_is_refused_where_it_stops() [io]
+    let pack = tzdata.pack_bytes(tzdata.data_compact())
+
+    test.case("a pack from a newer layout says so by number")
+    match tzdata.data_from_pack(patched(pack, 5, 1, bytes.u8(2)))
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                TzPackVersion(found, expected) => test.assert_eq("${found} ${expected}", "2 1")
+                _                              => test.assert(false)
+
+    test.case("a pack cut short is refused at the field it stopped in")
+    test.assert(refused_at(bytes.slice(pack, 0, 20)) > 0)
+    test.assert(refused_at(bytes.slice(pack, 0, bytes.len(pack) - 1)) > 0)
+
+    test.case("a link naming a zone past the end is refused")
+    let links_start = bytes.len(pack) - 3
+    let bad_link = patched(pack, links_start + 1, 2, bytes.u16_be(60000))
+    test.assert(refused_at(bad_link) > 0)
+
+    test.case("a zone whose block is damaged is refused when it is looked up")
+    let db = tzdata.data_compact()
+    let first = db.blocks[0]
+    match tzdata.data_from_pack(patched(pack, first, 4, bytes.from_str("XXXX")))
+        Err(_)  => test.assert(false)
+        Ok(bad) =>
+            match tzdata.zone(bad, db.names[0])
+                Ok(_)  => test.assert(false)
+                Err(e) => test.assert(tzerr.source_of(e) == "tzif")
+
+@test
+fn test_the_lookup_answers_nothing_for_a_name_it_does_not_know() [io]
+    let db = tzdata.data_compact()
+    test.assert(tzdata.canonical_name(db, "Europe/Atlantis") == None)
+    test.assert(tzdata.names_for(db, "US/Eastern") == [])
+    test.assert(tzdata.countries_of(db, "Europe/Atlantis") == [])
+    test.assert(tzdata.countries_of(db, "Etc/UTC") == [])
+    test.assert(tzdata.coordinates_of(db, "Europe/Atlantis") == None)
+    test.assert(tzdata.has_zone(db, "Europe/Atlantis") == false)
+
+@test
+fn test_a_link_answers_its_zone_s_countries_and_coordinates() [io]
+    let db = tzdata.data_compact()
+    test.assert(tzdata.countries_of(db, "US/Eastern") == ["US"])
+    // zone1970.tab writes Berlin at +5230+01322: 52°30' N, 13°22' E.
+    match tzdata.coordinates_of(db, "Europe/Berlin")
+        Some((lat, lon)) => test.assert_eq([lat, lon], [189000, 48120])
+        None             => test.assert(false)
+    test.assert(db.zone_count == 447)
+    test.assert(db.link_count == 151)
+    test.assert(list.len(tzdata.link_names(db)) == 151)

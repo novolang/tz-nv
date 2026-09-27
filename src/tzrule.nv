@@ -1,0 +1,224 @@
+// tzrule — the arithmetic of a POSIX TZ rule, for a device.
+//
+// A device with a real-time clock and no filesystem shows the hour in
+// one zone.  It holds that zone's POSIX rule, such as
+// `CET-1CEST,M3.5.0,M10.5.0/3`, as integers in its own flash, and asks
+// these functions about them.  Every function here is integer
+// arithmetic: no `Str`, no list, no allocation and no `Result`, and each
+// carries `@tier(embedded)`, so the compiler checks that on every build.
+// `tests/embedded_probe.nv` builds this module for a Cortex-M4.
+//
+// `tzposix` reads the rule from its text and asks the same questions on
+// a host, with these functions underneath.
+//
+// Every offset is seconds east of UTC.  The whole question "is it summer
+// time now", for an RTC reading `utc`, is:
+//
+//   let y = tzrule.local_year(utc, std_off)
+//   let s = tzrule.local_second_of_year(utc, std_off, y)
+//   let a = tzrule.rule_second_of_year(start_form, sm, sw, sd, st, y)
+//   let b = tzrule.rule_second_of_year(end_form, em, ew, ed, et, y) - (dst_off - std_off)
+//   let off = tzrule.offset_for(std_off, dst_off, tzrule.local_is_dst(a, b, s))
+//
+// The subtraction on the fourth line puts the end date, which the rule
+// writes in daylight time, on the standard-time clock the other numbers
+// are on.
+
+// The three spellings POSIX gives a transition date.
+//
+// No payloads, so the enum is a scalar a device can hold and match on.
+pub enum TzPosixForm
+    // `Mm.w.d`: month `m`, week `w` of it, weekday `d`.  Week 5 means
+    // the last such weekday in the month, not the fifth, so "the last
+    // Sunday in October" has a spelling.
+    TzPosixMonthWeekDay
+    // `Jn`: day `n` of the year, `1 ..= 365`, with the 29th of February
+    // never counted.  In a leap year `J60` is still the 1st of March.
+    TzPosixJulianNoLeap
+    // `n`: day `n` of the year, `0 ..= 365`, with the 29th of February
+    // counted.  The two Julian forms differ by one day for half of every
+    // leap year.
+    TzPosixJulianLeap
+
+// `a / b` rounded toward negative infinity, for a positive `b`.
+@tier(embedded)
+fn floor_div(a: Int, b: Int) -> Int []
+    let q = a / b
+    if a % b < 0
+        q - 1
+    else
+        q
+
+// The days from 1970-01-01 to year `y`, month `m`, day `d`: Howard
+// Hinnant's `days_from_civil`.
+@tier(embedded)
+fn days_from_civil(y: Int, m: Int, d: Int) -> Int []
+    let yy = if m <= 2
+        y - 1
+    else
+        y
+    let era = floor_div(yy, 400)
+    let yoe = yy - era * 400
+    let mp = if m > 2
+        m - 3
+    else
+        m + 9
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+
+// The year that day `z` after 1970-01-01 falls in: the year half of
+// Howard Hinnant's `civil_from_days`.
+@tier(embedded)
+fn year_of_day(z: Int) -> Int []
+    let zz = z + 719468
+    let era = floor_div(zz, 146097)
+    let doe = zz - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let y = yoe + era * 400
+    if mp >= 10
+        y + 1
+    else
+        y
+
+// The UTC second at which year `y` begins on a clock at offset 0.
+@tier(embedded)
+fn year_start_second(y: Int) -> Int []
+    days_from_civil(y, 1, 1) * 86400
+
+// The days in month `m` of year `y`.
+@tier(embedded)
+fn days_in_month(y: Int, m: Int) -> Int []
+    if m == 2
+        if is_leap_year(y)
+            29
+        else
+            28
+    else if m == 4 or m == 6 or m == 9 or m == 11
+        30
+    else
+        31
+
+// Whether `year` is a leap year on the proleptic Gregorian calendar.
+//
+// This repeats calendar-nv's `civil.is_leap_year`, and it is the one
+// repetition in the package.  calendar-nv does not build for a device,
+// so a device build could not call it.
+//
+// ```novo
+// use tzrule
+//
+// fn main() [io]
+//     println("${tzrule.is_leap_year(2024)} ${tzrule.is_leap_year(1900)}")   // true false
+// ```
+pub @tier(embedded)
+fn is_leap_year(year: Int) -> Bool []
+    year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+// The day of the year, counting from zero, that a rule date falls on.
+//
+// The four numbers are one `TzPosixDate`'s fields, passed loose so the
+// call holds no struct.  They are read according to `form`, as
+// `TzPosixDate` describes them.  Week 5 of `TzPosixMonthWeekDay` is the
+// last such weekday, so the last Sunday in March is day 87 in 2026 and
+// day 86 in 2027.
+//
+// ```novo
+// use tzrule
+//
+// fn main() [io]
+//     println("${tzrule.rule_day_of_year(TzPosixMonthWeekDay, 3, 5, 0, 2026)}")   // 87
+// ```
+pub @tier(embedded)
+fn rule_day_of_year(form: TzPosixForm, month: Int, week: Int, day: Int, year: Int) -> Int []
+    match form
+        TzPosixJulianLeap   => day
+        TzPosixJulianNoLeap => julian_no_leap_day(day, year)
+        TzPosixMonthWeekDay => month_week_day(month, week, day, year)
+
+// Day `n` of `Jn`, counting from zero, with the 29th of February
+// skipped.
+@tier(embedded)
+fn julian_no_leap_day(n: Int, year: Int) -> Int []
+    if is_leap_year(year) and n >= 60
+        n
+    else
+        n - 1
+
+// The day of the year, counting from zero, of weekday `d` in week `w`
+// of month `m`, with week 5 meaning the last.
+@tier(embedded)
+fn month_week_day(m: Int, w: Int, d: Int, year: Int) -> Int []
+    let first = days_from_civil(year, m, 1)
+    let first_weekday = (first % 7 + 11) % 7
+    var offset = (d - first_weekday + 7) % 7 + (w - 1) * 7
+    if offset >= days_in_month(year, m)
+        offset = offset - 7
+    first - days_from_civil(year, 1, 1) + offset
+
+// The second of the year, counting from zero at local midnight on the
+// 1st of January, at which a rule date and time falls.
+//
+// The day times 86400 plus `time_seconds`.  It is a function of its own
+// because `time_seconds` may be negative and may exceed a day, and the
+// answer is then in the previous or the next day.
+pub @tier(embedded)
+fn rule_second_of_year(form: TzPosixForm, month: Int, week: Int, day: Int, time_seconds: Int,
+                       year: Int) -> Int []
+    rule_day_of_year(form, month, week, day, year) * 86400 + time_seconds
+
+// Whether a second of the year falls inside daylight saving, given the
+// two boundaries on the same clock.
+//
+// In the southern hemisphere the rule wraps the end of the year: Sydney
+// starts daylight saving in October and ends it in April, so `start`
+// is later than `end` and the test is the union of two ranges.  That is
+// why this is a named function rather than a comparison each caller
+// writes.
+//
+// ```novo
+// use tzrule
+//
+// fn main() [io]
+//     println("${tzrule.local_is_dst(100, 200, 150)} ${tzrule.local_is_dst(200, 100, 150)}")   // true false
+// ```
+pub @tier(embedded)
+fn local_is_dst(start_second: Int, end_second: Int, local_second_of_year: Int) -> Bool []
+    if start_second <= end_second
+        local_second_of_year >= start_second and local_second_of_year < end_second
+    else
+        local_second_of_year >= start_second or local_second_of_year < end_second
+
+// The offset to apply: the daylight one when `is_dst`, the standard
+// one otherwise.
+pub @tier(embedded)
+fn offset_for(std_offset_seconds: Int, dst_offset_seconds: Int, is_dst: Bool) -> Int []
+    if is_dst
+        dst_offset_seconds
+    else
+        std_offset_seconds
+
+// The second of `year` that a UTC second falls on, on a clock at
+// `offset_seconds` east of UTC.
+//
+// `utc_second` counts from 1970-01-01T00:00:00Z.  The answer counts from
+// local midnight on the 1st of January of `year`, which is what
+// `local_is_dst` takes.
+pub @tier(embedded)
+fn local_second_of_year(utc_second: Int, offset_seconds: Int, year: Int) -> Int []
+    utc_second + offset_seconds - year_start_second(year)
+
+// The year a UTC second falls in, on a clock at `offset_seconds` east
+// of UTC.
+//
+// ```novo
+// use tzrule
+//
+// fn main() [io]
+//     println("${tzrule.local_year(1750000000, 3600)}")   // 2025
+// ```
+pub @tier(embedded)
+fn local_year(utc_second: Int, offset_seconds: Int) -> Int []
+    year_of_day(floor_div(utc_second + offset_seconds, 86400))

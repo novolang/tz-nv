@@ -1,0 +1,52 @@
+// tests/tzerr_tests.nv — every refusal's message, offset and source.
+//
+// Each value is built here rather than taken from a failed call, so
+// the wording is asserted variant by variant.
+
+use std.test
+use tzerr
+
+@test
+fn test_every_refusal_reads_as_one_line()
+    test.assert_eq(TzUnknownZone("Europe/Atlantis").message(), "unknown zone 'Europe/Atlantis'")
+    test.assert_eq(TzPackUnreadable(12).message(), "unreadable pack at offset 12")
+    test.assert_eq(TzPackVersion("2", "1").message(), "pack layout 2 where 1 is read")
+    test.assert_eq(TzZoneOutOfRange("UTC", 0).message(), "zone 'UTC' has no table to answer 0 from")
+    test.assert_eq(TzPosixMalformed(3).message(), "malformed POSIX TZ string at offset 3")
+    test.assert_eq(TzifBadMagic.message(), "not a TZif file: the first four bytes are not 'TZif'")
+    test.assert_eq(TzifUnsupportedVersion(53).message(), "TZif version byte 53 is not read")
+    test.assert_eq(TzifTruncated(44, 8, 3).message(), "TZif file ends at offset 44: 8 bytes needed, 3 left")
+    test.assert_eq(TzifNoTypes.message(), "TZif header declares no local-time types")
+    test.assert_eq(TzifTypeIndexOutOfRange(4, 2).message(), "TZif transition names type 4 of 2")
+    test.assert_eq(TzLocalRefused("Europe/Berlin", 1774751400, 0).message(),
+                   "wall time 1774751400 never happened in zone 'Europe/Berlin'")
+    test.assert_eq(TzLocalRefused("Europe/Berlin", 1792888200, 2).message(),
+                   "wall time 1792888200 happened 2 times in zone 'Europe/Berlin'")
+
+@test
+fn test_a_refusal_about_bytes_names_the_byte()
+    test.assert_eq(tzerr.offset_of(TzUnknownZone("x")), -1)
+    test.assert_eq(tzerr.offset_of(TzPackUnreadable(12)), 12)
+    test.assert_eq(tzerr.offset_of(TzPackVersion("2", "1")), 5)
+    test.assert_eq(tzerr.offset_of(TzZoneOutOfRange("UTC", 0)), -1)
+    test.assert_eq(tzerr.offset_of(TzPosixMalformed(3)), 3)
+    test.assert_eq(tzerr.offset_of(TzifBadMagic), 0)
+    test.assert_eq(tzerr.offset_of(TzifUnsupportedVersion(53)), 4)
+    test.assert_eq(tzerr.offset_of(TzifTruncated(44, 8, 3)), 44)
+    test.assert_eq(tzerr.offset_of(TzifNoTypes), -1)
+    test.assert_eq(tzerr.offset_of(TzifTypeIndexOutOfRange(4, 2)), -1)
+    test.assert_eq(tzerr.offset_of(TzLocalRefused("UTC", 0, 0)), -1)
+
+@test
+fn test_the_source_says_which_reader_spoke()
+    test.assert_eq(tzerr.source_of(TzUnknownZone("x")), "lookup")
+    test.assert_eq(tzerr.source_of(TzPackUnreadable(12)), "pack")
+    test.assert_eq(tzerr.source_of(TzPackVersion("2", "1")), "pack")
+    test.assert_eq(tzerr.source_of(TzZoneOutOfRange("UTC", 0)), "lookup")
+    test.assert_eq(tzerr.source_of(TzPosixMalformed(3)), "posix")
+    test.assert_eq(tzerr.source_of(TzifBadMagic), "tzif")
+    test.assert_eq(tzerr.source_of(TzifUnsupportedVersion(53)), "tzif")
+    test.assert_eq(tzerr.source_of(TzifTruncated(44, 8, 3)), "tzif")
+    test.assert_eq(tzerr.source_of(TzifNoTypes), "tzif")
+    test.assert_eq(tzerr.source_of(TzifTypeIndexOutOfRange(4, 2)), "tzif")
+    test.assert_eq(tzerr.source_of(TzLocalRefused("UTC", 0, 0)), "local")
