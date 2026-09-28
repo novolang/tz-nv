@@ -234,6 +234,16 @@ fn test_a_southern_rule_answers_across_the_new_year()
     test.assert_eq(tzposix.next_change_after(r, 1775318400) ?? 0, 1791043200)
 
 @test
+fn test_a_rule_in_daylight_time_all_year_has_no_changes()
+    // Daylight time starts on day 0 at 00:00 and ends on day 365 at
+    // 25:00, past the end of the year (POSIX.1-2017 section 8.3, TZ).
+    // The new-year boundaries change neither the offset nor the flag.
+    let r = tzposix.parse("EST5EDT,0/0,J365/25")!
+    test.assert(tzposix.is_dst_at(r, 1768435200))
+    test.assert_eq(tzposix.offset_seconds_at(r, 1768435200), -14400)
+    test.assert_eq(tzposix.next_change_after(r, 1768435200), None)
+
+@test
 fn test_a_fixed_rule_has_no_changes_and_one_name()
     let r = tzposix.fixed("IST", 19800)
     test.assert_eq(tzposix.is_dst_at(r, 0), false)

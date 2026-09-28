@@ -35,9 +35,8 @@ category    = "time"
 tags        = ["timezone", "tzdata", "iana", "zoneinfo", "tzif", "dst", "chrono-tz", "posix-tz"]
 repository  = "https://github.com/novolang/tz-nv"
 maintainers = ["novo-lang"]
-# Lists and `Bytes` as reference types, `if let` and negative indexing
-# are all in 0.13.0.
-novo        = ">= 0.13.0"
+# The bodies were tested on 0.14.0.
+novo        = ">= 0.14.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

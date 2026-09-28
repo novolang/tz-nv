@@ -5,11 +5,15 @@ All notable changes to tz-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## 0.1.0 — 2026-09-27
+## 0.1.0 — 2026-09-28
 
 The IANA database as data, the two conversions between an instant and
 a wall time, POSIX TZ rules, and TZif files, with tzdata 2026c
 bundled.
+
+The comment on `tzposix.next_change_after` says that a rule in daylight
+time all year has no change, and a test asserts it.  The toolchain floor
+is 0.14.0, the release the bodies were tested on.
 
 - `tzdata.data_compact()` is 127 057 bytes and `data_full()` 233 354,
   each holding 447 zones and 151 links.  Each zone keeps its

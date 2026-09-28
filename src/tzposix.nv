@@ -395,8 +395,10 @@ fn changes_near(r: TzPosixRule, utc_second: Int) -> [Int]
 // The UTC second of the rule's next change strictly after
 // `utc_second`.
 //
-// A fixed rule has none.  A rule with dates always has one, which is how
-// a zone with a footer answers questions about the year 2400.
+// A fixed rule has none.  A rule with dates has one, which is how a zone
+// with a footer answers questions about the year 2400.  The exception is
+// a rule in daylight time all year, such as `EST5EDT,0/0,J365/25`: its
+// dates change nothing, and it has none either.
 pub fn next_change_after(r: TzPosixRule, utc_second: Int) -> ?Int []
     if not r.has_dst
         return None

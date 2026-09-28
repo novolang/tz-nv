@@ -91,7 +91,7 @@ available.
 novo pkg add tz-nv
 ```
 
-tz-nv needs a novo-lang toolchain of 0.13.0 or newer.
+tz-nv needs a novo-lang toolchain of 0.14.0 or newer.
 
 ## Example
 
